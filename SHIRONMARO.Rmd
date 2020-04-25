@@ -1,0 +1,2229 @@
+---
+title: "Predicting Delays"
+author: "시로앤마로(민영, 재우, 지민, 형선, 은혁)"
+date: "2019년 9월 11일"
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+    number_sections: true
+    self_contained: true
+    lightbox: true
+    gallery: true
+---
+```{r global_option, include=FALSE}
+knitr::opts_chunk$set(echo=T, comment="", message=F, warning=F)
+```
+# Introduction  
+## 개요
+$$ EDA - Feature Engineering - Modeling - Ensemble - Prediction $$
+
+1) EDA(Exploratory Data Analysis)
+
+데이터 구조를 살펴보며 지연에 영향을 미치는 요인을 살펴봅니다.
+
+2) Feature Engineering
+
+지연 예측력을 향상시키기 위해 발견한 요인을 유용한 형태의 변수로 가공합니다.
+
+3) Modeling
+
+미리 선정한 5개의 학습법 모델에 데이터를 적합시킵니다.
+
+4) Ensemble
+
+5개의 학습법 모델을 모두 고려하여 예측 결과를 도출합니다.
+
+5) Prediction
+
+정확한 예측을 위해 일괄 예측 대신 날짜별, 기체별로 운항 순서에 따라 한 행씩 예측합니다.
+
+## 환경설정
+```{r settings, warning=F}
+library(rmdformats) # 기본 테마
+library(tidyverse) # ggplot2, stringr, dplyr
+library(data.table) # Data Loading
+library(kernlab) # Supporting Vector Machine
+library(xgboost) # XGBOOST
+library(randomForest) # Random Forest
+library(nnet) # Neural Network
+library(Metrics) # MSE 계산
+library(caret) # One Hot Encoding
+library(forecast) # predict weather
+library(tseries) # predict weather
+library(lubridate) # time process
+library(ggimage) # ggplot image
+library(png) #loading png 
+library(arules) # Association Rule
+library(arulesViz) # Association Rule Visualization 
+library(reshape) # Visualization Tool
+library(plotly) # Interactive Visualization
+library(gridExtra) # Visualization Tool
+library(ROSE) # ROSE sampling
+```
+
+
+```{r import data}
+AFSNT <- fread("./data/AFSNT.csv",stringsAsFactors=F,header=T); afsnt <- AFSNT
+AFSNT_DLY <- fread("./data/AFSNT_DLY.csv",stringsAsFactors=F,header=T); test <- AFSNT_DLY
+```
+
+# EDA
+
+## 비행 지연 사유 
+
+```{r plot C02}
+my_palette<-c("#33A9AC","#6A97F2","#858AF2",  "#07028C",  "#1C03BF",  "#2404F2",  "#3F2BBF","#291572","#69607E","#352459", "#343779", "#ADB0D9", "#8B5A8C", "#982062", "#623FB1","#8369C1","#8858F6")
+
+
+plt_drr<-ggplot(data=afsnt %>% 
+                  filter(DLY=="Y") %>% 
+                  group_by(DRR) %>% 
+                  summarise(N=n()) %>%
+                  arrange (-N)%>%
+                  head(17), aes(x=reorder(DRR,-N),N))+
+  geom_col(aes(fill=DRR),alpha=0.6) + scale_fill_manual(values=my_palette)+
+  ggtitle("비행 지연 사유")+
+  labs(x="지연 사유",y="지연 수")+
+  theme(legend.title = element_blank(),plot.title = element_text(size = 20,hjust=0.5),
+        legend.position = "none")
+plt_drr
+```
+
+C02(A/C 접속)사유로 가장 많이 지연되는 것을 볼 수 있습니다.
+
+즉, A/C 접속 지연 예측이 가장 중요하다고 할 수 있습니다.
+
+## 비행 지연 사유 *C02* 제외
+```{r plot except_C02}
+# 전체에서 C02 제외
+plt_drr_dC02<-ggplot(data=afsnt %>% 
+                  filter(DLY=="Y"&DRR!="C02") %>% 
+                  group_by(DRR) %>% 
+                  summarise(N=n()) %>%
+                  arrange (-N)%>%
+                  head(17), aes(x=reorder(DRR,-N),N))+
+  geom_col(aes(fill=DRR),alpha=0.6) + scale_fill_manual(values=my_palette) +
+  ggtitle("비행 지연 사유 - 'C02' 제외") + 
+  xlab("지연 사유") + 
+  ylab("지연 수") +
+  theme(plot.title = element_text(size = 20,hjust=0.5) , legend.position = "none")
+plt_drr_dC02
+
+```
+
+C02를 제외하고 지연 수를 살펴본 결과, 
+
+C01(A/C 정비), A01(안개) 차례로 높은 요인인 것을 확인했습니다.
+
+C01 예측을 위한 기체 변수, A01 예측을 위한 날씨 변수가 필요합니다.
+
+## 날씨 요인의 지연 수
+
+```{r plot weather}
+plt_weather<-ggplot(data=afsnt %>% 
+            filter(DLY=="Y"&str_detect(DRR,"A")) %>%
+            group_by(DRR) %>% 
+            summarise(N=n()) %>% 
+            head(10),aes(x=reorder(DRR,-N),y=N))+
+  geom_col(aes(fill=DRR),alpha=0.6)+
+  ggtitle("날씨 지연 사유")+
+  scale_fill_manual(values=my_palette)+
+  xlab("지연 사유")+
+  ylab("지연 수")+
+  theme(plot.title = element_text(size = 20,hjust=0.5),legend.title = element_blank(),
+        legend.position = "none")
+plt_weather
+```
+
+날씨 지연 사유만 살펴본 결과 A01(안개), A05(강풍)이 가장 많은 것으로 나타났습니다.
+
+A01 예측을 위한 안개 발생 조건 파악이 필요합니다.
+
+## 공항별 지연율
+
+```{r plot arp}
+plt_arp<-ggplot(data=afsnt %>% 
+                  mutate(DLY=ifelse(DLY=="Y",1,0)) %>% 
+                  filter(AOD=="D") %>% 
+                  group_by(ARP) %>% 
+                  summarise(a=sum(DLY),b=n()) %>% 
+                  mutate(p=a/b),aes(x=reorder(ARP,-p),y=p))+
+  geom_col(aes(fill=ARP),alpha=0.619) + scale_fill_manual(values=my_palette)+
+  ggtitle("공항별 지연율")+
+  xlab("공항")+
+  ylab("지연율")+
+  theme(plot.title = element_text(size = 20,hjust=0.5),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+plt_arp
+```
+
+공항마다 지연율이 상이함을 알 수 있습니다.
+
+특히 ARP15(인천), ARP13(군산), ARP3(제주) 세 개 공항의 지연율이 높습니다.
+
+공항마다 지연율이 다르게 나타나는 원인을 파악하기 위해 
+
+B(공항 요인)를 자세히 살펴 보았습니다.
+
+### 공항 요인 지연 수
+
+```{r B plot}
+plt_craft<-ggplot(data=AFSNT %>% 
+                    mutate(DLY=ifelse(DLY=="Y",1,0),
+                           DLY_B=ifelse(str_detect(DRR,"B"),1,0)) %>% 
+                    group_by(ARP) %>% 
+                    summarise(a=sum(DLY_B)) ,aes(x=ARP,y=sort(a, decreasing = T)))+
+  geom_col(aes(fill=ARP),alpha=0.6)+ scale_fill_manual(values=my_palette)+
+  ggtitle("공항 사유로 인한 지연 수")+
+  xlab("공항")+
+  ylab("지연 수")+
+  theme(plot.title = element_text(size = 20,hjust=0.5),
+        legend.position = "none", axis.text.x = element_text(angle=45, hjust = 1))
+plt_craft
+```
+
+B(공항 요인)로 인한 지연 수를 살펴본 결과,
+
+공항 별로 차이가 크다는 점을 확인했습니다.
+
+즉, 공항 자체가 중요한 변수로 작용할 것입니다.
+
+## 시간대별 지연율
+
+```{r time_plot}
+## STT를 시간 변수로 바꾸고 지연율 계산하는 함수
+arp_tuner_d <- function(df){
+  afsnt_d <- df %>% filter(AOD=='D')
+  afsnt_d <- afsnt_d %>% select(STT,DLY,DRR) %>%
+    mutate(DLY=ifelse(DLY=="Y",1,0),C02=ifelse(DRR=="C02",1,0))
+  afsnt_d$schedule<-strptime(afsnt_d$STT,"%H:%M")
+  afsnt_d$timeslot<-afsnt_d$schedule$hour
+  afsnt_d<-afsnt_d%>%
+    select(timeslot,DLY,C02)%>%
+    group_by(timeslot)%>%
+    summarise(n=n(),DLY_sum=sum(DLY),C02_sum=sum(C02))%>%
+    mutate(prop_dly=DLY_sum/n,prop_C02=C02_sum/n)
+  return(afsnt_d)
+}
+
+
+image<-readPNG("./image/aircraft.png")
+
+plt_time_prop <- ggplot(data=arp_tuner_d(afsnt) %>%
+                          mutate(image="./image/aircraft.png"),aes(x=timeslot,y=prop_dly)) +
+  geom_image(aes(image=image),size=0.07)+geom_line(col="#33A9AC",lwd=0.3)+
+  xlim(6,22)+
+  ylim(0,0.4)+
+  ggtitle("시간대별 지연율")+
+  xlab("시간대 / 24h")+
+  ylab("지연율")+
+  theme(plot.title = element_text(size = 20,hjust=0.5),
+        legend.position = "none", axis.text.x = element_text(angle=45, hjust = 1))
+plt_time_prop
+
+plt_time_C02<-ggplot(data=arp_tuner_d(afsnt) %>% filter(timeslot>=6 & timeslot<=22),aes(x=timeslot,y=prop_dly,group=1))+
+  geom_col(aes(x=as.factor(timeslot),y=prop_dly),alpha=0.619)+
+  geom_col(aes(x=as.factor(timeslot),y=prop_C02,fill="red"))+
+  ggtitle("시간대 별 C02의 지연율")+
+  labs(x="시간대",y="C02 지연율", fill="C02 지연율\n", colour="C02")+
+  scale_color_hue(labels="C02" ) +
+  theme(plot.title = element_text(size = 20,hjust=0.5))
+plt_time_C02 + scale_fill_discrete(labels="C02")
+```
+
+오전보다는 오후에 지연이 더 잦은 것을 확인할 수 있습니다.
+
+시간대에 따라 지연 여부가 영향을 받을 것이라고 판단했습니다.
+
+
+# Feature Engineering
+
+## 외부 데이터 불러오기
+
+### weather_arp.csv  
+  
+항공 기상청에서 가져온 공항의 날씨 데이터입니다.
+
+#### 변수 설명
+
+  + PS_AVG : 평균 해면 기압(hpa)
+  
+  + TMP_AVG, TMP_MAX, TMP_MNM : 평균/ 최대/ 최저 기온 (ºC)
+  
+  + TD_AVG : 평균 이슬점(ºC)
+  
+  + HM_AVG, HM_MNM : 평균/ 최저 상대 습도(%)
+  
+  + WSPD_AVG, WSPD_MAX, WSPD_INS : 평균/ 최대/ 최대순간 풍속 (knot)
+  
+  + CA_TOT_AVG, CLA : 평균/ 최저운고 운량(1/8)
+  
+  + RN_SUM : 강수량(mm)
+  
+  + VIS_MNM : 최단 시정(10m)
+
+```{r weather, eval=FALSE}
+### ARP15(incheon)
+dat_list_2017<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP15/"
+  dat_list_2017[[i]]<-read.csv(paste0(wd,"MONTH_2017",i,"_RKSI.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2017[[i]]<-cbind(2017,i,"ARP15",dat_list_2017[[i]])
+  colnames(dat_list_2017[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2017[[i]]$RN_SUM<-ifelse(is.na(dat_list_2017[[i]]$RN_SUM),0,dat_list_2017[[i]]$RN_SUM)
+  dat_list_2017[[i]]$SD_MAX<-ifelse(is.na(dat_list_2017[[i]]$SD_MAX),0,dat_list_2017[[i]]$SD_MAX)
+  dat_list_2017[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2017[[i]]$VIS_MNM),1000,dat_list_2017[[i]]$VIS_MNM)
+  dat_list_2017[[i]]$CLA<-ifelse(is.na(dat_list_2017[[i]]$CLA),0,dat_list_2017[[i]]$CLA)
+  dat_list_2017[[i]]$BASE<-ifelse(is.na(dat_list_2017[[i]]$BASE),0,dat_list_2017[[i]]$BASE)
+}
+dat_list_2018<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP15/"
+  dat_list_2018[[i]]<-read.csv(paste0(wd,"MONTH_2018",i,"_RKSI.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2018[[i]]<-cbind(2018,i,"ARP15",dat_list_2018[[i]])
+  colnames(dat_list_2018[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2018[[i]]$RN_SUM<-ifelse(is.na(dat_list_2018[[i]]$RN_SUM),0,dat_list_2018[[i]]$RN_SUM)
+  dat_list_2018[[i]]$SD_MAX<-ifelse(is.na(dat_list_2018[[i]]$SD_MAX),0,dat_list_2018[[i]]$SD_MAX)
+  dat_list_2018[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2018[[i]]$VIS_MNM),1000,dat_list_2018[[i]]$VIS_MNM)
+  dat_list_2018[[i]]$CLA<-ifelse(is.na(dat_list_2018[[i]]$CLA),0,dat_list_2018[[i]]$CLA)
+  dat_list_2018[[i]]$BASE<-ifelse(is.na(dat_list_2018[[i]]$BASE),0,dat_list_2018[[i]]$BASE)
+}
+dat_list_2019<-list()
+for(i in 1:6){
+  wd<-"./data/airweather/ARP15/"
+  dat_list_2019[[i]]<-read.csv(paste0(wd,"MONTH_20190",i,"_RKSI.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2019[[i]]<-cbind(2019,i,"ARP15",dat_list_2019[[i]])
+  colnames(dat_list_2019[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2019[[i]]$RN_SUM<-ifelse(is.na(dat_list_2019[[i]]$RN_SUM),0,dat_list_2019[[i]]$RN_SUM)
+  dat_list_2019[[i]]$SD_MAX<-ifelse(is.na(dat_list_2019[[i]]$SD_MAX),0,dat_list_2019[[i]]$SD_MAX)
+  dat_list_2019[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2019[[i]]$VIS_MNM),1000,dat_list_2019[[i]]$VIS_MNM)
+  dat_list_2019[[i]]$CLA<-ifelse(is.na(dat_list_2019[[i]]$CLA),0,dat_list_2019[[i]]$CLA)
+  dat_list_2019[[i]]$BASE<-ifelse(is.na(dat_list_2019[[i]]$BASE),0,dat_list_2019[[i]]$BASE)
+}
+weather_arp15<-rbind(dat_list_2017[[1]],dat_list_2017[[2]],dat_list_2017[[3]],dat_list_2017[[4]],dat_list_2017[[5]],dat_list_2017[[6]],dat_list_2017[[7]],dat_list_2017[[8]],dat_list_2017[[9]],dat_list_2017[[10]],dat_list_2017[[11]],dat_list_2017[[12]],
+                     dat_list_2018[[1]],dat_list_2018[[2]],dat_list_2018[[3]],dat_list_2018[[4]],dat_list_2018[[5]],dat_list_2018[[6]],dat_list_2018[[7]],dat_list_2018[[8]],dat_list_2018[[9]],dat_list_2018[[10]],dat_list_2018[[11]],dat_list_2018[[12]],
+                     dat_list_2019[[1]],dat_list_2019[[2]],dat_list_2019[[3]],dat_list_2019[[4]],dat_list_2019[[5]],dat_list_2019[[6]])
+### ARP1(gimpo)
+dat_list_2017<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP1/"
+  dat_list_2017[[i]]<-read.csv(paste0(wd,"MONTH_2017",i,"_RKSS.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2017[[i]]<-cbind(2017,i,"ARP1",dat_list_2017[[i]])
+  colnames(dat_list_2017[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2017[[i]]$RN_SUM<-ifelse(is.na(dat_list_2017[[i]]$RN_SUM),0,dat_list_2017[[i]]$RN_SUM)
+  dat_list_2017[[i]]$SD_MAX<-ifelse(is.na(dat_list_2017[[i]]$SD_MAX),0,dat_list_2017[[i]]$SD_MAX)
+  dat_list_2017[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2017[[i]]$VIS_MNM),1000,dat_list_2017[[i]]$VIS_MNM)
+  dat_list_2017[[i]]$CLA<-ifelse(is.na(dat_list_2017[[i]]$CLA),0,dat_list_2017[[i]]$CLA)
+  dat_list_2017[[i]]$BASE<-ifelse(is.na(dat_list_2017[[i]]$BASE),0,dat_list_2017[[i]]$BASE)
+}
+dat_list_2018<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP1/"
+  dat_list_2018[[i]]<-read.csv(paste0(wd,"MONTH_2018",i,"_RKSS.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2018[[i]]<-cbind(2018,i,"ARP1",dat_list_2018[[i]])
+  colnames(dat_list_2018[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2018[[i]]$RN_SUM<-ifelse(is.na(dat_list_2018[[i]]$RN_SUM),0,dat_list_2018[[i]]$RN_SUM)
+  dat_list_2018[[i]]$SD_MAX<-ifelse(is.na(dat_list_2018[[i]]$SD_MAX),0,dat_list_2018[[i]]$SD_MAX)
+  dat_list_2018[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2018[[i]]$VIS_MNM),1000,dat_list_2018[[i]]$VIS_MNM)
+  dat_list_2018[[i]]$CLA<-ifelse(is.na(dat_list_2018[[i]]$CLA),0,dat_list_2018[[i]]$CLA)
+  dat_list_2018[[i]]$BASE<-ifelse(is.na(dat_list_2018[[i]]$BASE),0,dat_list_2018[[i]]$BASE)
+}
+dat_list_2019<-list()
+for(i in 1:6){
+  wd<-"./data/airweather/ARP1/"
+  dat_list_2019[[i]]<-read.csv(paste0(wd,"MONTH_20190",i,"_RKSS.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2019[[i]]<-cbind(2019,i,"ARP1",dat_list_2019[[i]])
+  colnames(dat_list_2019[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2019[[i]]$RN_SUM<-ifelse(is.na(dat_list_2019[[i]]$RN_SUM),0,dat_list_2019[[i]]$RN_SUM)
+  dat_list_2019[[i]]$SD_MAX<-ifelse(is.na(dat_list_2019[[i]]$SD_MAX),0,dat_list_2019[[i]]$SD_MAX)
+  dat_list_2019[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2019[[i]]$VIS_MNM),1000,dat_list_2019[[i]]$VIS_MNM)
+  dat_list_2019[[i]]$CLA<-ifelse(is.na(dat_list_2019[[i]]$CLA),0,dat_list_2019[[i]]$CLA)
+  dat_list_2019[[i]]$BASE<-ifelse(is.na(dat_list_2019[[i]]$BASE),0,dat_list_2019[[i]]$BASE)
+}
+weather_arp1<-rbind(dat_list_2017[[1]],dat_list_2017[[2]],dat_list_2017[[3]],dat_list_2017[[4]],dat_list_2017[[5]],dat_list_2017[[6]],dat_list_2017[[7]],dat_list_2017[[8]],dat_list_2017[[9]],dat_list_2017[[10]],dat_list_2017[[11]],dat_list_2017[[12]],
+                    dat_list_2018[[1]],dat_list_2018[[2]],dat_list_2018[[3]],dat_list_2018[[4]],dat_list_2018[[5]],dat_list_2018[[6]],dat_list_2018[[7]],dat_list_2018[[8]],dat_list_2018[[9]],dat_list_2018[[10]],dat_list_2018[[11]],dat_list_2018[[12]],
+                    dat_list_2019[[1]],dat_list_2019[[2]],dat_list_2019[[3]],dat_list_2019[[4]],dat_list_2019[[5]],dat_list_2019[[6]])
+###ARP3(jeju)
+dat_list_2017<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP3/"
+  dat_list_2017[[i]]<-read.csv(paste0(wd,"MONTH_2017",i,"_RKPC.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2017[[i]]<-cbind(2017,i,"ARP3",dat_list_2017[[i]])
+  colnames(dat_list_2017[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2017[[i]]$RN_SUM<-ifelse(is.na(dat_list_2017[[i]]$RN_SUM),0,dat_list_2017[[i]]$RN_SUM)
+  dat_list_2017[[i]]$SD_MAX<-ifelse(is.na(dat_list_2017[[i]]$SD_MAX),0,dat_list_2017[[i]]$SD_MAX)
+  dat_list_2017[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2017[[i]]$VIS_MNM),1000,dat_list_2017[[i]]$VIS_MNM)
+  dat_list_2017[[i]]$CLA<-ifelse(is.na(dat_list_2017[[i]]$CLA),0,dat_list_2017[[i]]$CLA)
+  dat_list_2017[[i]]$BASE<-ifelse(is.na(dat_list_2017[[i]]$BASE),0,dat_list_2017[[i]]$BASE)
+}
+dat_list_2018<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP3/"
+  dat_list_2018[[i]]<-read.csv(paste0(wd,"MONTH_2018",i,"_RKPC.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2018[[i]]<-cbind(2018,i,"ARP3",dat_list_2018[[i]])
+  colnames(dat_list_2018[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2018[[i]]$RN_SUM<-ifelse(is.na(dat_list_2018[[i]]$RN_SUM),0,dat_list_2018[[i]]$RN_SUM)
+  dat_list_2018[[i]]$SD_MAX<-ifelse(is.na(dat_list_2018[[i]]$SD_MAX),0,dat_list_2018[[i]]$SD_MAX)
+  dat_list_2018[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2018[[i]]$VIS_MNM),1000,dat_list_2018[[i]]$VIS_MNM)
+  dat_list_2018[[i]]$CLA<-ifelse(is.na(dat_list_2018[[i]]$CLA),0,dat_list_2018[[i]]$CLA)
+  dat_list_2018[[i]]$BASE<-ifelse(is.na(dat_list_2018[[i]]$BASE),0,dat_list_2018[[i]]$BASE)
+}
+dat_list_2019<-list()
+for(i in 1:6){
+  wd<-"./data/airweather/ARP3/"
+  dat_list_2019[[i]]<-read.csv(paste0(wd,"MONTH_20190",i,"_RKPC.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2019[[i]]<-cbind(2019,i,"ARP3",dat_list_2019[[i]])
+  colnames(dat_list_2019[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2019[[i]]$RN_SUM<-ifelse(is.na(dat_list_2019[[i]]$RN_SUM),0,dat_list_2019[[i]]$RN_SUM)
+  dat_list_2019[[i]]$SD_MAX<-ifelse(is.na(dat_list_2019[[i]]$SD_MAX),0,dat_list_2019[[i]]$SD_MAX)
+  dat_list_2019[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2019[[i]]$VIS_MNM),1000,dat_list_2019[[i]]$VIS_MNM)
+  dat_list_2019[[i]]$CLA<-ifelse(is.na(dat_list_2019[[i]]$CLA),0,dat_list_2019[[i]]$CLA)
+  dat_list_2019[[i]]$BASE<-ifelse(is.na(dat_list_2019[[i]]$BASE),0,dat_list_2019[[i]]$BASE)
+}
+weather_arp3<-rbind(dat_list_2017[[1]],dat_list_2017[[2]],dat_list_2017[[3]],dat_list_2017[[4]],dat_list_2017[[5]],dat_list_2017[[6]],dat_list_2017[[7]],dat_list_2017[[8]],dat_list_2017[[9]],dat_list_2017[[10]],dat_list_2017[[11]],dat_list_2017[[12]],
+                    dat_list_2018[[1]],dat_list_2018[[2]],dat_list_2018[[3]],dat_list_2018[[4]],dat_list_2018[[5]],dat_list_2018[[6]],dat_list_2018[[7]],dat_list_2018[[8]],dat_list_2018[[9]],dat_list_2018[[10]],dat_list_2018[[11]],dat_list_2018[[12]],
+                    dat_list_2019[[1]],dat_list_2019[[2]],dat_list_2019[[3]],dat_list_2019[[4]],dat_list_2019[[5]],dat_list_2019[[6]])
+### ARP7(muan)
+dat_list_2017<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP7/"
+  dat_list_2017[[i]]<-read.csv(paste0(wd,"MONTH_2017",i,"_RKJB.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2017[[i]]<-cbind(2017,i,"ARP7",dat_list_2017[[i]])
+  colnames(dat_list_2017[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2017[[i]]$RN_SUM<-ifelse(is.na(dat_list_2017[[i]]$RN_SUM),0,dat_list_2017[[i]]$RN_SUM)
+  dat_list_2017[[i]]$SD_MAX<-ifelse(is.na(dat_list_2017[[i]]$SD_MAX),0,dat_list_2017[[i]]$SD_MAX)
+  dat_list_2017[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2017[[i]]$VIS_MNM),1000,dat_list_2017[[i]]$VIS_MNM)
+  dat_list_2017[[i]]$CLA<-ifelse(is.na(dat_list_2017[[i]]$CLA),0,dat_list_2017[[i]]$CLA)
+  dat_list_2017[[i]]$BASE<-ifelse(is.na(dat_list_2017[[i]]$BASE),0,dat_list_2017[[i]]$BASE)
+}
+dat_list_2018<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP7/"
+  dat_list_2018[[i]]<-read.csv(paste0(wd,"MONTH_2018",i,"_RKJB.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2018[[i]]<-cbind(2018,i,"ARP7",dat_list_2018[[i]])
+  colnames(dat_list_2018[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2018[[i]]$RN_SUM<-ifelse(is.na(dat_list_2018[[i]]$RN_SUM),0,dat_list_2018[[i]]$RN_SUM)
+  dat_list_2018[[i]]$SD_MAX<-ifelse(is.na(dat_list_2018[[i]]$SD_MAX),0,dat_list_2018[[i]]$SD_MAX)
+  dat_list_2018[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2018[[i]]$VIS_MNM),1000,dat_list_2018[[i]]$VIS_MNM)
+  dat_list_2018[[i]]$CLA<-ifelse(is.na(dat_list_2018[[i]]$CLA),0,dat_list_2018[[i]]$CLA)
+  dat_list_2018[[i]]$BASE<-ifelse(is.na(dat_list_2018[[i]]$BASE),0,dat_list_2018[[i]]$BASE)
+}
+dat_list_2019<-list()
+for(i in 1:6){
+  wd<-"./data/airweather/ARP7/"
+  dat_list_2019[[i]]<-read.csv(paste0(wd,"MONTH_20190",i,"_RKJB.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2019[[i]]<-cbind(2019,i,"ARP7",dat_list_2019[[i]])
+  colnames(dat_list_2019[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2019[[i]]$RN_SUM<-ifelse(is.na(dat_list_2019[[i]]$RN_SUM),0,dat_list_2019[[i]]$RN_SUM)
+  dat_list_2019[[i]]$SD_MAX<-ifelse(is.na(dat_list_2019[[i]]$SD_MAX),0,dat_list_2019[[i]]$SD_MAX)
+  dat_list_2019[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2019[[i]]$VIS_MNM),1000,dat_list_2019[[i]]$VIS_MNM)
+  dat_list_2019[[i]]$CLA<-ifelse(is.na(dat_list_2019[[i]]$CLA),0,dat_list_2019[[i]]$CLA)
+  dat_list_2019[[i]]$BASE<-ifelse(is.na(dat_list_2019[[i]]$BASE),0,dat_list_2019[[i]]$BASE)
+}
+weather_arp7<-rbind(dat_list_2017[[1]],dat_list_2017[[2]],dat_list_2017[[3]],dat_list_2017[[4]],dat_list_2017[[5]],dat_list_2017[[6]],dat_list_2017[[7]],dat_list_2017[[8]],dat_list_2017[[9]],dat_list_2017[[10]],dat_list_2017[[11]],dat_list_2017[[12]],
+                    dat_list_2018[[1]],dat_list_2018[[2]],dat_list_2018[[3]],dat_list_2018[[4]],dat_list_2018[[5]],dat_list_2018[[6]],dat_list_2018[[7]],dat_list_2018[[8]],dat_list_2018[[9]],dat_list_2018[[10]],dat_list_2018[[11]],dat_list_2018[[12]],
+                    dat_list_2019[[1]],dat_list_2019[[2]],dat_list_2019[[3]],dat_list_2019[[4]],dat_list_2019[[5]],dat_list_2019[[6]])
+###ARP5(ulsan)
+dat_list_2017<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP5/"
+  dat_list_2017[[i]]<-read.csv(paste0(wd,"MONTH_2017",i,"_RKPU.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2017[[i]]<-cbind(2017,i,"ARP5",dat_list_2017[[i]])
+  colnames(dat_list_2017[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2017[[i]]$RN_SUM<-ifelse(is.na(dat_list_2017[[i]]$RN_SUM),0,dat_list_2017[[i]]$RN_SUM)
+  dat_list_2017[[i]]$SD_MAX<-ifelse(is.na(dat_list_2017[[i]]$SD_MAX),0,dat_list_2017[[i]]$SD_MAX)
+  dat_list_2017[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2017[[i]]$VIS_MNM),1000,dat_list_2017[[i]]$VIS_MNM)
+  dat_list_2017[[i]]$CLA<-ifelse(is.na(dat_list_2017[[i]]$CLA),0,dat_list_2017[[i]]$CLA)
+  dat_list_2017[[i]]$BASE<-ifelse(is.na(dat_list_2017[[i]]$BASE),0,dat_list_2017[[i]]$BASE)
+}
+dat_list_2018<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP5/"
+  dat_list_2018[[i]]<-read.csv(paste0(wd,"MONTH_2018",i,"_RKPU.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2018[[i]]<-cbind(2018,i,"ARP5",dat_list_2018[[i]])
+  colnames(dat_list_2018[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2018[[i]]$RN_SUM<-ifelse(is.na(dat_list_2018[[i]]$RN_SUM),0,dat_list_2018[[i]]$RN_SUM)
+  dat_list_2018[[i]]$SD_MAX<-ifelse(is.na(dat_list_2018[[i]]$SD_MAX),0,dat_list_2018[[i]]$SD_MAX)
+  dat_list_2018[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2018[[i]]$VIS_MNM),1000,dat_list_2018[[i]]$VIS_MNM)
+  dat_list_2018[[i]]$CLA<-ifelse(is.na(dat_list_2018[[i]]$CLA),0,dat_list_2018[[i]]$CLA)
+  dat_list_2018[[i]]$BASE<-ifelse(is.na(dat_list_2018[[i]]$BASE),0,dat_list_2018[[i]]$BASE)
+}
+dat_list_2019<-list()
+for(i in 1:6){
+  wd<-"./data/airweather/ARP5/"
+  dat_list_2019[[i]]<-read.csv(paste0(wd,"MONTH_20190",i,"_RKPU.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2019[[i]]<-cbind(2019,i,"ARP5",dat_list_2019[[i]])
+  colnames(dat_list_2019[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2019[[i]]$RN_SUM<-ifelse(is.na(dat_list_2019[[i]]$RN_SUM),0,dat_list_2019[[i]]$RN_SUM)
+  dat_list_2019[[i]]$SD_MAX<-ifelse(is.na(dat_list_2019[[i]]$SD_MAX),0,dat_list_2019[[i]]$SD_MAX)
+  dat_list_2019[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2019[[i]]$VIS_MNM),0,dat_list_2019[[i]]$VIS_MNM)
+  dat_list_2019[[i]]$CLA<-ifelse(is.na(dat_list_2019[[i]]$CLA),0,dat_list_2019[[i]]$CLA)
+  dat_list_2019[[i]]$BASE<-ifelse(is.na(dat_list_2019[[i]]$BASE),0,dat_list_2019[[i]]$BASE)
+}
+weather_arp5<-rbind(dat_list_2017[[1]],dat_list_2017[[2]],dat_list_2017[[3]],dat_list_2017[[4]],dat_list_2017[[5]],dat_list_2017[[6]],dat_list_2017[[7]],dat_list_2017[[8]],dat_list_2017[[9]],dat_list_2017[[10]],dat_list_2017[[11]],dat_list_2017[[12]],
+                    dat_list_2018[[1]],dat_list_2018[[2]],dat_list_2018[[3]],dat_list_2018[[4]],dat_list_2018[[5]],dat_list_2018[[6]],dat_list_2018[[7]],dat_list_2018[[8]],dat_list_2018[[9]],dat_list_2018[[10]],dat_list_2018[[11]],dat_list_2018[[12]],
+                    dat_list_2019[[1]],dat_list_2019[[2]],dat_list_2019[[3]],dat_list_2019[[4]],dat_list_2019[[5]],dat_list_2019[[6]])
+###ARP9(yusu)
+dat_list_2017<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP9/"
+  dat_list_2017[[i]]<-read.csv(paste0(wd,"MONTH_2017",i,"_RKJY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2017[[i]]<-cbind(2017,i,"ARP9",dat_list_2017[[i]])
+  colnames(dat_list_2017[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2017[[i]]$RN_SUM<-ifelse(is.na(dat_list_2017[[i]]$RN_SUM),0,dat_list_2017[[i]]$RN_SUM)
+  dat_list_2017[[i]]$SD_MAX<-ifelse(is.na(dat_list_2017[[i]]$SD_MAX),0,dat_list_2017[[i]]$SD_MAX)
+  dat_list_2017[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2017[[i]]$VIS_MNM),1000,dat_list_2017[[i]]$VIS_MNM)
+  dat_list_2017[[i]]$CLA<-ifelse(is.na(dat_list_2017[[i]]$CLA),0,dat_list_2017[[i]]$CLA)
+  dat_list_2017[[i]]$BASE<-ifelse(is.na(dat_list_2017[[i]]$BASE),0,dat_list_2017[[i]]$BASE)
+}
+dat_list_2018<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP9/"
+  dat_list_2018[[i]]<-read.csv(paste0(wd,"MONTH_2018",i,"_RKJY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2018[[i]]<-cbind(2018,i,"ARP9",dat_list_2018[[i]])
+  colnames(dat_list_2018[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2018[[i]]$RN_SUM<-ifelse(is.na(dat_list_2018[[i]]$RN_SUM),0,dat_list_2018[[i]]$RN_SUM)
+  dat_list_2018[[i]]$SD_MAX<-ifelse(is.na(dat_list_2018[[i]]$SD_MAX),0,dat_list_2018[[i]]$SD_MAX)
+  dat_list_2018[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2018[[i]]$VIS_MNM),1000,dat_list_2018[[i]]$VIS_MNM)
+  dat_list_2018[[i]]$CLA<-ifelse(is.na(dat_list_2018[[i]]$CLA),0,dat_list_2018[[i]]$CLA)
+  dat_list_2018[[i]]$BASE<-ifelse(is.na(dat_list_2018[[i]]$BASE),0,dat_list_2018[[i]]$BASE)
+}
+dat_list_2019<-list()
+for(i in 1:6){
+  wd<-"./data/airweather/ARP9/"
+  dat_list_2019[[i]]<-read.csv(paste0(wd,"MONTH_20190",i,"_RKJY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2019[[i]]<-cbind(2019,i,"ARP9",dat_list_2019[[i]])
+  colnames(dat_list_2019[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2019[[i]]$RN_SUM<-ifelse(is.na(dat_list_2019[[i]]$RN_SUM),0,dat_list_2019[[i]]$RN_SUM)
+  dat_list_2019[[i]]$SD_MAX<-ifelse(is.na(dat_list_2019[[i]]$SD_MAX),0,dat_list_2019[[i]]$SD_MAX)
+  dat_list_2019[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2019[[i]]$VIS_MNM),1000,dat_list_2019[[i]]$VIS_MNM)
+  dat_list_2019[[i]]$CLA<-ifelse(is.na(dat_list_2019[[i]]$CLA),0,dat_list_2019[[i]]$CLA)
+  dat_list_2019[[i]]$BASE<-ifelse(is.na(dat_list_2019[[i]]$BASE),0,dat_list_2019[[i]]$BASE)
+}
+weather_arp9<-rbind(dat_list_2017[[1]],dat_list_2017[[2]],dat_list_2017[[3]],dat_list_2017[[4]],dat_list_2017[[5]],dat_list_2017[[6]],dat_list_2017[[7]],dat_list_2017[[8]],dat_list_2017[[9]],dat_list_2017[[10]],dat_list_2017[[11]],dat_list_2017[[12]],
+                    dat_list_2018[[1]],dat_list_2018[[2]],dat_list_2018[[3]],dat_list_2018[[4]],dat_list_2018[[5]],dat_list_2018[[6]],dat_list_2018[[7]],dat_list_2018[[8]],dat_list_2018[[9]],dat_list_2018[[10]],dat_list_2018[[11]],dat_list_2018[[12]],
+                    dat_list_2019[[1]],dat_list_2019[[2]],dat_list_2019[[3]],dat_list_2019[[4]],dat_list_2019[[5]],dat_list_2019[[6]])
+### ARP10 yang
+dat_list_2017<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP10/"
+  dat_list_2017[[i]]<-read.csv(paste0(wd,"MONTH_2017",i,"_RKNY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2017[[i]]<-cbind(2017,i,"ARP10",dat_list_2017[[i]])
+  colnames(dat_list_2017[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2017[[i]]$RN_SUM<-ifelse(is.na(dat_list_2017[[i]]$RN_SUM),0,dat_list_2017[[i]]$RN_SUM)
+  dat_list_2017[[i]]$SD_MAX<-ifelse(is.na(dat_list_2017[[i]]$SD_MAX),0,dat_list_2017[[i]]$SD_MAX)
+  dat_list_2017[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2017[[i]]$VIS_MNM),1000,dat_list_2017[[i]]$VIS_MNM)
+  dat_list_2017[[i]]$CLA<-ifelse(is.na(dat_list_2017[[i]]$CLA),0,dat_list_2017[[i]]$CLA)
+  dat_list_2017[[i]]$BASE<-ifelse(is.na(dat_list_2017[[i]]$BASE),0,dat_list_2017[[i]]$BASE)
+}
+dat_list_2018<-list()
+for(i in 1:12){
+  wd<-"./data/airweather/ARP10/"
+  dat_list_2018[[i]]<-read.csv(paste0(wd,"MONTH_2018",i,"_RKNY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2018[[i]]<-cbind(2018,i,"ARP10",dat_list_2018[[i]])
+  colnames(dat_list_2018[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2018[[i]]$RN_SUM<-ifelse(is.na(dat_list_2018[[i]]$RN_SUM),0,dat_list_2018[[i]]$RN_SUM)
+  dat_list_2018[[i]]$SD_MAX<-ifelse(is.na(dat_list_2018[[i]]$SD_MAX),0,dat_list_2018[[i]]$SD_MAX)
+  dat_list_2018[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2018[[i]]$VIS_MNM),1000,dat_list_2018[[i]]$VIS_MNM)
+  dat_list_2018[[i]]$CLA<-ifelse(is.na(dat_list_2018[[i]]$CLA),0,dat_list_2018[[i]]$CLA)
+  dat_list_2018[[i]]$BASE<-ifelse(is.na(dat_list_2018[[i]]$BASE),0,dat_list_2018[[i]]$BASE)
+}
+dat_list_2019<-list()
+for(i in 1:6){
+  wd<-"./data/airweather/ARP10/"
+  dat_list_2019[[i]]<-read.csv(paste0(wd,"MONTH_20190",i,"_RKNY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+  dat_list_2019[[i]]<-cbind(2019,i,"ARP10",dat_list_2019[[i]])
+  colnames(dat_list_2019[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+  dat_list_2019[[i]]$RN_SUM<-ifelse(is.na(dat_list_2019[[i]]$RN_SUM),0,dat_list_2019[[i]]$RN_SUM)
+  dat_list_2019[[i]]$SD_MAX<-ifelse(is.na(dat_list_2019[[i]]$SD_MAX),0,dat_list_2019[[i]]$SD_MAX)
+  dat_list_2019[[i]]$VIS_MNM<-ifelse(is.na(dat_list_2019[[i]]$VIS_MNM),1000,dat_list_2019[[i]]$VIS_MNM)
+  dat_list_2019[[i]]$CLA<-ifelse(is.na(dat_list_2019[[i]]$CLA),0,dat_list_2019[[i]]$CLA)
+  dat_list_2019[[i]]$BASE<-ifelse(is.na(dat_list_2019[[i]]$BASE),0,dat_list_2019[[i]]$BASE)
+}
+weather_arp10<-rbind(dat_list_2017[[1]],dat_list_2017[[2]],dat_list_2017[[3]],dat_list_2017[[4]],dat_list_2017[[5]],dat_list_2017[[6]],dat_list_2017[[7]],dat_list_2017[[8]],dat_list_2017[[9]],dat_list_2017[[10]],dat_list_2017[[11]],dat_list_2017[[12]],
+                     dat_list_2018[[1]],dat_list_2018[[2]],dat_list_2018[[3]],dat_list_2018[[4]],dat_list_2018[[5]],dat_list_2018[[6]],dat_list_2018[[7]],dat_list_2018[[8]],dat_list_2018[[9]],dat_list_2018[[10]],dat_list_2018[[11]],dat_list_2018[[12]],
+                     dat_list_2019[[1]],dat_list_2019[[2]],dat_list_2019[[3]],dat_list_2019[[4]],dat_list_2019[[5]],dat_list_2019[[6]])
+## export the data
+# write.csv(weather_arp1,"weather_arp1.csv",row.names = F)
+# write.csv(weather_arp10,"weather_arp10.csv",row.names = F)
+# write.csv(weather_arp15,"weather_arp15.csv",row.names = F)
+# write.csv(weather_arp3,"weather_arp3.csv",row.names = F)
+# write.csv(weather_arp5,"weather_arp5.csv",row.names = F)
+# write.csv(weather_arp7,"weather_arp7.csv",row.names = F)
+# write.csv(weather_arp9,"weather_arp9.csv",row.names = F)
+weather_arp<-rbind(weather_arp1,weather_arp3,weather_arp5,weather_arp7,weather_arp9,weather_arp10,weather_arp15) %>%
+  mutate(MIST=TMP_MNM-TD_AVG,HM_INV=1/HM_AVG) %>% 
+  select(-c(CLF,SD_MAX,WD_MAX,WD_INS,TMP_AVG,TMP_MAX,TMP_MNM,TD_AVG,HM_AVG,HM_MNM))
+# write.csv(weather_arp,"weather_arp.csv",row.names=F)
+```
+  
+### airport data.csv
+
+인천공항은 서울지방항공청, 그 외 공항은 한국공항공사 공공데이터에서 가져온 데이터입니다
+
+#### 변수설명
+
+  + APRON_SIZE : 계류장 면적
+
+  + CRAFT_STAND : 최대 동시 주기 수
+
+```{r import airport data}
+parking_17 <- read.csv("./data/airport/parking_17.csv",stringsAsFactors=F)
+parking_18 <- read.csv("./data/airport/parking_18.csv",stringsAsFactors=F)
+parking_19 <- read.csv("./data/airport/parking_19.csv",stringsAsFactors=F)
+
+icn <- c('ARP15',2437000,171)
+
+parking_tuner <- function(data, year){
+  data <- data %>% select(c(1,2,3))
+  colnames(data) <- c('ARP','size','craft')
+  data$ARP <- str_trim(data$ARP)
+  data$ARP <- ifelse(data$ARP=='김포','ARP1',data$ARP)
+  data$ARP <- ifelse(data$ARP=='김해','ARP2',data$ARP)
+  data$ARP <- ifelse(data$ARP=='제주','ARP3',data$ARP)
+  data$ARP <- ifelse(data$ARP=='대구','ARP4',data$ARP)
+  data$ARP <- ifelse(data$ARP=='울산','ARP5',data$ARP)
+  data$ARP <- ifelse(data$ARP=='청주','ARP6',data$ARP)
+  data$ARP <- ifelse(data$ARP=='무안','ARP7',data$ARP)
+  data$ARP <- ifelse(data$ARP=='광주','ARP8',data$ARP)
+  data$ARP <- ifelse(data$ARP=='여수','ARP9',data$ARP)
+  data$ARP <- ifelse(data$ARP=='양양','ARP10',data$ARP)
+  data$ARP <- ifelse(data$ARP=='포항','ARP11',data$ARP)
+  data$ARP <- ifelse(data$ARP=='사천','ARP12',data$ARP)
+  data$ARP <- ifelse(data$ARP=='군산','ARP13',data$ARP)
+  data$ARP <- ifelse(data$ARP=='원주','ARP14',data$ARP)
+  data$size <- as.integer(gsub(',','',data$size))
+  data$craft <- sapply(data$craft, function(x) as.integer(str_split(x, pattern='\\(')[[1]][1]))
+  data <- rbind(data, icn)
+  data$SDT_YY <- year
+  data <- data %>% select(SDT_YY, ARP, size, craft)
+  return(data)
+}
+
+airport <- rbind(parking_tuner(parking_17, 2017),
+                 parking_tuner(parking_18, 2018),
+                 parking_tuner(parking_19, 2019))
+airport$size <- as.integer(airport$size)
+airport$craft <- as.integer(airport$craft)
+colnames(airport) <- c('SDT_YY','ARP','APRON_SIZE','CRAFT_STAND')
+head(airport,5)
+# write.csv(airport,'airport data.csv',row.names=F)
+```
+
+
+## 항공기 일정 파악하기
+
+```{r Prep for Analysis}
+# 시간 변수 정리하기
+afsnt <- afsnt %>% mutate(DATE=as_date(paste(SDT_YY,'-',SDT_MM,'-',SDT_DD)),
+                          SCT=as.integer(gsub(':','',STT)), # 순서를 매기기 위해
+                          STT2=hm(STT), # 시-분 형태로 표현
+                          ATT2=hm(ATT), # 시-분 형태로 표현
+                          DIF=ATT2-STT2) # 지연된 시간
+afsnt$DIF <- afsnt$DIF@hour*60 + afsnt$DIF@minute # 분으로 표현
+afsnt <- afsnt %>% select(-c(STT2, ATT2))
+
+###afsnt DLY 시간 날짜 정리 
+AFSNT_DLY <- AFSNT_DLY %>% mutate(DATE=as_date(paste(SDT_YY,'-',SDT_MM,'-',SDT_DD)),
+                                  SCT=as.integer(gsub(':','',STT)) )
+```
+
+### Association Analysis - 연관 분석
+
+각각의 REG가 운항하는 FLT가 서로 어떤 연관성을 가지는 지 파악하기 위해 연관분석을 실행합니다.
+
+```{r Association Analysis}
+# 예측해야 하는 DLY 와 공통인 항공편만 정리 
+afsnt_common <- afsnt%>% filter(FLT %in% AFSNT_DLY$FLT) %>% arrange(DATE,FLT,SCT) 
+
+REG_FLT <- afsnt_common  %>% filter(AOD =='D',DATE>='2019-03-31')%>% select(REG,FLT,DATE)
+
+# 항공사 별로 운항 수가 가장 많은 Top REG 뽑기 
+A_REG_FLT <- afsnt_common  %>% filter(FLO=='A',AOD =='D',DATE>='2019-03-31')%>% select(REG,FLT,DATE)
+B_REG_FLT <- afsnt_common  %>% filter(FLO=='B',AOD =='D',DATE>='2019-03-31')%>% select(REG,FLT,DATE)
+F_REG_FLT <- afsnt_common  %>% filter(FLO=='F',AOD =='D',DATE>='2019-03-31')%>% select(REG,FLT,DATE)
+H_REG_FLT <- afsnt_common  %>% filter(FLO=='H',AOD =='D',DATE>='2019-03-31')%>% select(REG,FLT,DATE)
+I_REG_FLT <- afsnt_common  %>% filter(FLO=='I',AOD =='D',DATE>='2019-03-31')%>% select(REG,FLT,DATE)
+J_REG_FLT <- afsnt_common  %>% filter(FLO=='J',AOD =='D',DATE>='2019-03-31')%>% select(REG,FLT,DATE)
+L_REG_FLT <- afsnt_common  %>% filter(FLO=='L',AOD =='D',DATE>='2019-03-31')%>% select(REG,FLT,DATE)
+
+# REG 중 top 10 만 추리기 
+A_TOPREG <- A_REG_FLT %>% group_by(REG) %>% summarise(n=n()) %>%
+  arrange(desc(n))%>% as.data.frame() %>% select(REG)
+A_TOPREG <- A_TOPREG[1:10,]
+
+B_REG_FLT <- B_REG_FLT %>% group_by(REG) %>% summarise(n=n()) %>%
+  arrange(desc(n))%>% as.data.frame() %>% select(REG)
+B_REG_FLT <- B_REG_FLT[1:10,]
+
+F_REG_FLT <- F_REG_FLT %>% group_by(REG) %>% summarise(n=n()) %>%
+  arrange(desc(n))%>% as.data.frame() %>% select(REG)
+F_REG_FLT <- F_REG_FLT[1:10,]
+
+H_REG_FLT <- H_REG_FLT %>% group_by(REG) %>% summarise(n=n()) %>%
+  arrange(desc(n))%>% as.data.frame() %>% select(REG)
+H_REG_FLT <- H_REG_FLT[1:10,]
+
+I_REG_FLT <- I_REG_FLT %>% group_by(REG) %>% summarise(n=n()) %>%
+  arrange(desc(n))%>% as.data.frame() %>% select(REG)
+I_REG_FLT <- I_REG_FLT[1:10,]
+
+J_REG_FLT <- J_REG_FLT %>% group_by(REG) %>% summarise(n=n()) %>%
+  arrange(desc(n))%>% as.data.frame() %>% select(REG)
+J_REG_FLT <- J_REG_FLT[1:10,]
+
+L_REG_FLT <- L_REG_FLT %>% group_by(REG) %>% summarise(n=n()) %>%
+  arrange(desc(n))%>% as.data.frame() %>% select(REG)
+L_REG_FLT <- L_REG_FLT[1:10,]
+
+```
+
+### 항공사별 REG로 연관 분석시행 
+
+```{r Association Analysis02}
+# REG 별로 연관 분석시행 
+# REG 별  Shopper  = Day  //  Item = FLT
+
+# A 항공사  
+A_tran <- REG_FLT %>% filter(REG %in% A_TOPREG) #top 10 reg 있는 것만 선택
+A_tran$DATE <- A_tran$DATE %>% as.character.Date()
+A_unique_date <- unique(A_tran$DATE)# 날 씨 는 총 92 일 
+
+# 빈 리스트 생성 by assign 함수 
+
+y<-list(); A_top <-list()
+
+# top10 FLT - 루프로 돌리기 
+# REG별 &날짜별로 나열 후, 해당 REG가 다니는 FLT 를 세개 씩 묶어 정리한다. -> 서로의 연속성을 살리기위해
+for (l in 1:10) {
+  y<-list()
+  for (i in seq(length(A_unique_date))){
+    FLT_COL <- A_tran %>% filter(REG==A_TOPREG[l], DATE== A_unique_date[i])  %>% select(FLT) 
+    FLT_COL <- unlist(FLT_COL) %>% as.vector()
+    
+    if(length(FLT_COL) != 0){
+      if(length(FLT_COL) != 1){
+        if(length(FLT_COL) != 2){
+          len = length(FLT_COL)-2
+          
+          for (j in seq(len)){
+            k = j+2
+            x <- c(FLT_COL[j:k])
+            y <- append(y,list(x))
+          }
+        }  
+      } 
+    }
+  }
+  A_top[[l]] <- y
+}  
+
+# Transaction data 로 변환 
+# apiori 함수 사용
+# https://m.blog.naver.com/leedk1110/220788082381
+
+####변수에 대한 설명
+# https://m.blog.naver.com/PostView.nhn?blogId=gkenq&logNo=10188110816&proxyReferer=https%3A%2F%2Fwww.google.com%2F
+
+A_rule <- list()
+for ( i in seq(10)){
+  A_rule[[i]] <-  apriori(A_top[[i]],control = list(verbos=F), parameter = list(support=0.01,minlen=3))
+}
+# inspect(sort(A_rule[[7]],by='lift'))
+```
+
+```{r Association Analysis03}
+# 얻어낸 rule 들을 data frame화 
+# A 항공사 최다 빈도 REG 로 확인 해보기 
+A_rule_data <- list()
+for (i in 1){
+  A_rule_data[[i]] <- inspect(sort(A_rule[[i]],by='lift')) %>%  as.data.frame()
+}
+
+```
+
+#### Association Rule 설명   
+품목 A 와 B 의 연관성을 나타냅니다.( A 가 선택되었을 때 B 가 선택되는 비율)
+
+  + lhs : left hand side (품목 A)  
+  + rhs : right hand side (품목 B)  
+  + Support : 지지도 (품목 A와 B를 포함하는 거래수 / 전체 거래 수)  
+  + Confidence : 신뢰도 (품목 A의 거래 중에서 품목 B를 포함하는 거래 수)  
+  + Lift : 향상도 (연관 계측 능력에 대한 수치)    
+  
+### 연관분석 결과에 대한 해석
+
+ lhs에 해당하는 FLT 가 있으면 해당 FLT를 운항한 기체는 
+ 
+ rhs에 해당하는 FLT를 운항할 것으로 해석 가능합니다.
+ 
+ SFSNT를 통해 기체별 일정의 반복성을 파악한 후,
+ 
+ AFSNT의 REG를 AFSNT_DLY에 적용했습니다.
+ 
+ 이것이 적절한 추론인지 재확인하기 위해 연관 분석을 사용했습니다.
+
+### A 항공편 연관분석 예시 
+
+REG : "SEw3NTk0" 의 Association Rule
+
+```{r Example of Association Analysis}
+# 1st REG
+A_rule_data[[1]][1:5,] 
+```
+  
+루틴을 적용한 AFSNT_DLY 의 FLT 들이 연관성이 있는지를 확인해보면,
+
+모든 FLT 들이 서로 높은 연관성있는 FLT 그룹임을 확인할 수 있습니다.
+  
+#### 예시
+
+'A' 항공사의 REG : "SEw3NTk0" 
+
+해당 REG 에 대해서 AFSNT_DLY 에 입힌 REG 의 FLT 들이 합당한지에 대해서 Association Rule 에서 얻은 연관 FLT 와 비교하며 확인합니다.
+
+```{r Example of Checking the Routine}
+reg_afsnt_dly <- fread('./data/afsnt_dly_predict.csv',stringsAsFactors=F,header=T) 
+uni_flt <- reg_afsnt_dly %>% filter(REG=="SEw3NTk0") %>% select(FLT) %>% unique()
+flt_1<-c()
+```
+  
+```{r Association Analysis04}
+for(i in 1){
+  A_rule_data[i][[1]]$lhs<-as.character(A_rule_data[i][[1]]$lhs)
+  A_rule_data[i][[1]]$rhs<-as.character(A_rule_data[i][[1]]$rhs)
+  
+  A_rule_data[i][[1]]$lhs<-gsub("\\{","",A_rule_data[i][[1]]$lhs)
+  A_rule_data[i][[1]]$lhs<-gsub("\\}","",A_rule_data[i][[1]]$lhs)
+  A_rule_data[i][[1]]$rhs<-gsub("\\{","",A_rule_data[i][[1]]$rhs)
+  A_rule_data[i][[1]]$rhs<-gsub("\\}","",A_rule_data[i][[1]]$rhs)
+  
+  A_rule_data[i][[1]]$group<-strsplit(A_rule_data[i][[1]]$lhs,",")
+  
+  for(j in 1:nrow(A_rule_data[i][[1]])){
+    A_rule_data[i][[1]]$group[[j]]<-append(A_rule_data[i][[1]]$group[[j]],A_rule_data[i][[1]]$rhs[j])
+  }
+}
+
+flt_1<-c()
+for(j in 1:nrow(A_rule_data[1][[1]])){
+  flt_1<-append(flt_1, A_rule_data[1][[1]]$group[[j]])
+}
+
+correct <-c()
+for ( i in 1:nrow(uni_flt) ){
+  correct[i] <- ifelse(uni_flt$FLT[i] %in% flt_1 , 1, 0)
+}
+
+# 모든 값이 존재함을 확인 할 수 있다 
+```
+
+## MIST & HM_INV
+
+안개가 생긴다면 시정이 짧아진다는 사실에 초점을 두고,
+
+이를 표현할 수 있는 새로운 변수를 만들었습니다.
+
+### MIST
+
+안개의 생성 조건 중 하나는 기온이 이슬점보다 낮아지는 것입니다.
+
+$$ VIS\_MNM \propto (TMP\_MNM-TD\_AVG) \rightarrow MIST $$
+
+
+```{r FE MIST}
+# MIST & VIS_MNM plot
+weather_arp<-fread("./data/weather_arp.csv", stringsAsFactors=F)
+plt_mist<-ggplot(data=weather_arp[weather_arp$SDT_MM==9&VIS_MNM!=1000,],aes(x=MIST,y=VIS_MNM))+
+  geom_point(color="blue")+
+  geom_smooth(method="lm",col="red",se=F)+
+  ggtitle("Feature Engineering : MIST")+
+  theme(plot.title = element_text(size = 20,hjust=0.5))
+plt_mist
+```
+
+### HM_INV
+
+안개의 생성 조건 중 다른 하나는 습도가 높은 것입니다.
+
+$$ VIS\_MNM \propto \frac{1}{HM\_AVG} \rightarrow  HM\_INV $$
+
+```{r FE HM_INV}
+plt_HM_INV<-ggplot(data=weather_arp[weather_arp$SDT_MM==9&VIS_MNM!=1000,],aes(x=HM_INV,y=VIS_MNM))+
+  geom_point(color="blue")+
+  geom_smooth(method="lm",col="red",se=F)+
+  ggtitle("Feature Engineering : HM_INV")+
+  theme(plot.title = element_text(size = 20,hjust=0.5))
+plt_HM_INV
+```
+
+## 스케줄 혼잡도
+
+### COMPLEXITY
+
+특정 항공기의 STT(예정시간)를 기준으로 1시간 이전부터 예정되어 있는 운항 수를 나타낸 변수입니다.
+
+단위 시간 내에 운항 수가 증가하면 공항이 혼잡해진다는 가정 하에,
+
+이는 비행 지연에 영향을 끼칠 것으로 판단했습니다.
+
+```{r schedule complexity, eval=FALSE}
+AFSNT <- fread("./data/AFSNT.csv",stringsAsFactors=F,header=T)
+afsnt<-AFSNT
+
+arp_tuner <- function(df,i){
+  afsnt_d <- df %>% filter(AOD=='D' & ARP==paste0('ARP',i))
+  afsnt_a <- df %>% filter(AOD=='A' & ODP==paste0('ARP',i))
+  afsnt_arp <- rbind(afsnt_d, afsnt_a)
+  afsnt_arp <- afsnt_arp %>% select(SDT_YY,SDT_MM,SDT_DD,STT,ARP,ODP,AOD,FLT) %>%
+    mutate(STTT=paste(SDT_YY,SDT_MM,SDT_DD,STT,sep=':'),
+           POSIX=as.POSIXct(STTT,format='%Y:%m:%d:%H:%M')) %>% arrange(POSIX)
+  afsnt_arp$schedule <- strptime(afsnt_arp$STTT,'%Y:%m:%d:%H:%M')
+  schedule_time <- afsnt_arp$schedule$hour*60 + afsnt_arp$schedule$min
+  count <- c(1); tmp <- 1; cnt <- 0
+  for (i in 2:nrow(afsnt_arp)){
+    if(afsnt_arp$schedule[i]$mday!=afsnt_arp$schedule[i-1]$mday){
+      tmp <- i; count[i] <- 1
+    } else{
+      cnt <- 0
+      for (j in tmp:i){
+        if(schedule_time[i] - schedule_time[j] <= 60){
+          cnt <- cnt+1
+        }
+      }
+      count[i] <- cnt
+    }
+  }
+  afsnt_arp <- cbind(afsnt_arp, count) %>% select(-c('POSIX','STTT','schedule'))
+  return(afsnt_arp)
+}
+
+complexity <- arp_tuner(afsnt,1)
+for (i in 2:15){
+  complexity <- rbind(complexity, arp_tuner(afsnt,i))
+}
+```
+
+
+## 시간대별 *C02* (A/C 접속) 지연율 
+
+### C02
+
+위에서 A/C 접속 예측의 중요성을 언급했기에,
+
+시간대별, 공항별 A/C 접속 지연율을 변수로 추가했습니다.
+
+```{r propC02}
+AFSNT <- fread("./data/AFSNT.csv",stringsAsFactors = F,header=T)
+afsnt<-AFSNT
+## AOD가 D일 때
+arp_tuner_d <- function(df,i){
+  afsnt_d <- df %>% filter(AOD=='D' & ARP==paste0('ARP',i))
+  #afsnt_a <- df %>% filter(AOD=='A' & ARP==paste0('ARP',i))
+  #afsnt_arp <- rbind(afsnt_d, afsnt_a)
+  afsnt_d <- afsnt_d %>% select(ARP,STT,DLY,DRR) %>%
+    mutate(C02=ifelse(DRR=="C02",1,0),
+           DLY_=ifelse(DLY=="Y",1,0))
+  afsnt_d$schedule<-strptime(afsnt_d$STT,"%H:%M")
+  afsnt_d$timeslot<-afsnt_d$schedule$hour
+  afsnt_d<-afsnt_d%>%
+    select(timeslot,ARP,DLY_,C02)%>%
+    group_by(timeslot)%>%
+    summarise(n=n(),DLY_sum=sum(DLY_),DRR_C02=sum(C02))%>%
+    mutate(prop_C02=DRR_C02/n,prop_DLY=DLY_sum/n,
+           ARP=paste0('ARP',i))
+  return(afsnt_d)
+}
+
+D_Prop_C02 <- arp_tuner_d(afsnt,1)
+for (i in 2:15){
+  D_Prop_C02 <- rbind(D_Prop_C02, arp_tuner_d(afsnt,i))
+}
+
+# write.csv(D_Prop_C02, 'Proportion_C02_D.csv', row.names=F)
+
+## AOD=A일 때
+arp_tuner_a <- function(df,i){
+  #afsnt_d <- df %>% filter(AOD=='D' & ARP==paste0('ARP',i))
+  afsnt_a <- df %>% filter(AOD=='A' & ARP==paste0('ARP',i))
+  #afsnt_arp <- rbind(afsnt_d, afsnt_a)
+  afsnt_a <- afsnt_a %>% select(ARP,STT,DLY,DRR) %>%
+    mutate(C02=ifelse(DRR=="C02",1,0),
+           DLY_=ifelse(DLY=="Y",1,0))
+  afsnt_a$schedule<-strptime(afsnt_a$STT,"%H:%M")
+  afsnt_a$timeslot<-afsnt_a$schedule$hour
+  afsnt_a<-afsnt_a%>%
+    select(timeslot,ARP,DLY_,C02)%>%
+    group_by(timeslot)%>%
+    summarise(n=n(),DLY_sum=sum(DLY_),DRR_C02=sum(C02))%>%
+    mutate(prop_C02=DRR_C02/n,ARP=paste0('ARP',i))
+  return(afsnt_a)
+}
+
+A_Prop_C02 <- arp_tuner_a(afsnt,1)
+for (i in 2:15){
+  A_Prop_C02 <- rbind(A_Prop_C02, arp_tuner_a(afsnt,i))
+}
+
+# write.csv(A_Prop_C02, 'Proportion_C02_A.csv', row.names=F)
+
+
+
+
+
+```
+
+## REG별 지연 관련 변수 
+  
+### REG RATE
+
+REG별 C02를 제외한 항공 지연율 밀도 분포 그래프를 그린 후,
+
+범위에 따라 범주화를 통해 변수를 만들었습니다.
+
+```{R REG RATE}
+third <- AFSNT %>% group_by(REG) %>% mutate(ALL=n()) %>%
+  filter(str_detect(DRR,'C')==T, DRR!='C02') %>%  
+  group_by(REG) %>% mutate(N=n(),RATE=N/ALL)
+b <- third %>% select(REG, RATE) %>% unique()
+p <- qplot(RATE, data=b, geom='density')+
+  ggtitle("기체별 불량률 분포")+
+  labs(x="불량률")+
+  theme(legend.title = element_blank(),plot.title = element_text(size = 20,hjust=0.5),
+        legend.position = "none")
+ggplotly(p)
+```
+  
+왼쪽으로 치우친 분포를 따르는 것으로 보아 
+
+기체 당 정비 문제가 평균적으로 균일하게 일어나지만, 예외적으로 불량률이 높은 기체가 존재합니다.  
+
+불량률의 분포에 따라 REG를 범주화하여 REG_RATE 변수를 생성했습니다.
+  
+### PAST
+
+같은 REG를 가진 기체에 대해서 앞선 운항이 지연되면 다음 운항들이 연쇄적으로 지연이 되는 것을 확인했습니다.
+
+따라서, 앞선 운항의 지연 여부를 PAST 변수로 생성했습니다.
+
+```{r PAST}
+past_tuner <- function(df){
+  df <- df %>% mutate(DATE=as.Date(paste0(SDT_YY,'-',SDT_MM,'-',SDT_DD)),
+                      TIME=as.numeric(gsub(':','',STT))) %>%
+    group_by(DATE, REG) %>% mutate(ORDER=rank(TIME)) %>% arrange(DATE, REG, TIME)
+  order <- df$ORDER; dly <- df$DLY; reg <- df$REG
+  n <- nrow(df); empty <- c()
+  for (i in 1:n){
+    if (order[i]==1|reg[i]==''){
+      empty <- empty %>% append(0)
+    }
+    else if (order[i]-1==order[i-1]){
+      if (dly[i-1]=='Y'){
+        empty <- empty %>% append(1)
+      }
+      else{
+        empty <- empty %>% append(0)
+      }
+    }
+    else {
+      empty <- empty %>% append(NA)
+    }
+  }
+  output <- cbind(df, PAST=empty) %>% as.data.frame() %>% select(-c(DATE, TIME, ORDER))
+  return(output)
+}
+```
+
+# Modeling
+
+## 훈련 데이터
+
+위에서 생성한 여러 변수들을 기존의 AFSNT.csv에 붙여서 모델링을 위한 준비 작업을 했습니다.
+
+#### 변수 설명 
+  + COMPLEXITY : 공항 혼잡도  
+  + APRON_SIZE : 계류장 면적
+  + CRAFT_STAND : 최대 동시 주기 수
+  + C02 : 시간별 A/C 접속 지연 비율  
+  + WEATHER : 날씨 관련 변수들   
+  + ARP / ODP : 기준 공항 / 상대 공항  
+  + FLO : 항공사  
+  + SDT_DY : 요일  
+  + REG_RATE : REG 별로 
+  + PAST : 이전 스켸줄의 지연 여부 
+
+```{r 9 10}
+plt_arp<-ggplot(data=AFSNT %>% 
+                  mutate(DLY=ifelse(DLY=="Y",1,0),
+                         DLY_A=ifelse(str_detect(DRR,"A"),1,0)) %>% 
+                  group_by(SDT_MM) %>% 
+                  summarise(a=sum(DLY_A),b=n()) %>% 
+                  mutate(p=a/b),aes(x=as.factor(SDT_MM),y=p))+
+  geom_col(aes(fill=SDT_MM),alpha=0.6)+
+  ggtitle("월별 날씨 지연율")+
+  xlab("월")+
+  ylab("지연율")+
+  theme(plot.title = element_text(size = 20,hjust=0.5),legend.title = element_blank(),
+        legend.position = "none")
+weather_arp<-fread("./data/weather_arp.csv",header = T,stringsAsFactors = F)
+plt_weather<-ggplot(data=weather_arp %>% 
+                      group_by(SDT_MM) %>% 
+                      summarise(a=mean(RN_SUM)),aes(x=as.factor(SDT_MM),y=a))+
+  geom_col(aes(fill=SDT_MM),alpha=0.6)+
+  ggtitle("월별 평균 강우량")+
+  xlab("월")+
+  ylab("평균 강우량")+
+  theme(legend.title = element_blank(),plot.title = element_text(size = 20,hjust=0.5),
+        legend.position = "none")
+gridExtra::grid.arrange(plt_arp,plt_weather,nrow=1,ncol=2)
+```
+
+최종적으로 예측해야 할 시기는 9월 16일부터 9월 30일까지이므로 정확도를 위해 
+
+강우량이 비슷한 9월과 10월의 데이터만 이용하여 train_model.csv 파일을 만들었습니다.
+
+```{r make train data}
+AFSNT <- fread("./data/AFSNT.csv",stringsAsFactors = F,header=T);afsnt<-AFSNT;
+weather_arp<-fread("./data/weather_arp.csv",header = T)
+prop_C02_A<-fread("./data/Proportion_C02_A.csv",header = T,stringsAsFactors = F)
+prop_C02_D<-fread("./data/Proportion_C02_D.csv",header = T,stringsAsFactors = F)
+airport <- fread("./data/airport_data.csv",header = T,stringsAsFactors = F)
+
+## Schedule Complexity
+arp_tuner <- function(df,i){
+  afsnt_d <- df %>% filter(AOD=='D' & ARP==paste0('ARP',i))
+  afsnt_a <- df %>% filter(AOD=='A' & ARP==paste0('ARP',i))
+  afsnt_arp <- rbind(afsnt_d, afsnt_a)
+  afsnt_arp <- afsnt_arp %>% select(SDT_YY,SDT_MM,SDT_DD,STT,ARP,ODP,AOD,FLT) %>%
+    mutate(STTT=paste(SDT_YY,SDT_MM,SDT_DD,STT,sep=':'),
+           POSIX=as.POSIXct(STTT,format='%Y:%m:%d:%H:%M')) %>% arrange(POSIX)
+  afsnt_arp$schedule <- strptime(afsnt_arp$STTT,'%Y:%m:%d:%H:%M')
+  schedule_time <- afsnt_arp$schedule$hour*60 + afsnt_arp$schedule$min
+  COMPLEXITY <- c(1); tmp <- 1; cnt <- 0
+  for (i in 2:nrow(afsnt_arp)){
+    if(afsnt_arp$schedule[i]$mday!=afsnt_arp$schedule[i-1]$mday){
+      tmp <- i; COMPLEXITY[i] <- 1
+    } else{
+      cnt <- 0
+      for (j in tmp:i){
+        if(schedule_time[i] - schedule_time[j] <= 60){
+          cnt <- cnt+1
+        }
+      }
+      COMPLEXITY[i] <- cnt
+    }
+  }
+  afsnt_arp <- cbind(afsnt_arp, COMPLEXITY) %>% select(-c('POSIX','STTT','schedule'))
+  return(afsnt_arp)
+}
+
+COMPLEXITY <- arp_tuner(afsnt,1)
+for (i in 2:15){
+  COMPLEXITY <- rbind(COMPLEXITY, arp_tuner(afsnt,i))
+}
+
+afsnt<-left_join(afsnt,COMPLEXITY,by=c("SDT_YY","SDT_MM","SDT_DD","STT","ARP","ODP","AOD","FLT"))
+
+## airport data
+afsnt<-left_join(afsnt,airport,by=c("ARP","SDT_YY"))
+
+## devide AOD = A or D
+afsnt_D<-afsnt %>% 
+  filter(AOD=="D")
+
+afsnt_A<-afsnt %>% 
+  filter(AOD=="A")
+
+## prop_B,C,D if AOD=A
+afsnt_A$schedule<-strptime(afsnt_A$STT,"%H:%M")
+afsnt_A$timeslot<-afsnt_A$schedule$hour
+afsnt_A<-left_join(afsnt_A %>% select(-schedule),prop_C02_A,by=c("ARP","timeslot")) %>% 
+  select(-c(timeslot,n,DLY_sum,DRR_C02)) %>% 
+  dplyr::rename(C02=prop_C02)
+
+## prop_B,C,D if AOD=D
+afsnt_D$schedule<-strptime(afsnt_D$STT,"%H:%M")
+afsnt_D$timeslot<-afsnt_D$schedule$hour
+afsnt_D<-left_join(afsnt_D %>% select(-schedule),prop_C02_D,by=c("ARP","timeslot")) %>% 
+  select(-c(timeslot,n,DLY_sum,DRR_C02,prop_DLY)) %>% 
+  dplyr::rename(C02=prop_C02)
+
+
+## weather data
+afsnt_D$ARP_fake<-ifelse(afsnt_D$ARP %in% c("ARP2","ARP4","ARP11"),"ARP5",
+                         ifelse(afsnt_D$ARP %in% c("ARP8","ARP12"),"ARP9",
+                                ifelse(afsnt_D$ARP=="ARP6","ARP15",
+                                       ifelse(afsnt_D$ARP=="ARP13","ARP7",
+                                              ifelse(afsnt_D$ARP=="ARP14","ARP10",afsnt_D$ARP)))))
+afsnt_A$ODP_fake<-ifelse(afsnt_A$ODP %in% c("ARP2","ARP4","ARP11"),"ARP5",
+                         ifelse(afsnt_A$ODP %in% c("ARP8","ARP12"),"ARP9",
+                                ifelse(afsnt_A$ODP=="ARP6","ARP15",
+                                       ifelse(afsnt_A$ODP=="ARP13","ARP7",
+                                              ifelse(afsnt_A$ODP=="ARP14","ARP10",afsnt_A$ODP)))))
+
+afsnt_D<-left_join(afsnt_D,weather_arp,by=c("SDT_YY"="SDT_YY","SDT_MM"="SDT_MM",
+                                            "ARP_fake"="ARP","SDT_DD"="DATE")) %>% 
+  select(-ARP_fake)
+
+
+afsnt_A<-left_join(afsnt_A,weather_arp,by=c("SDT_YY"="SDT_YY","SDT_MM"="SDT_MM",
+                                            "ODP_fake"="ARP","SDT_DD"="DATE")) %>% 
+  select(-ODP_fake)
+
+afsnt<-rbind(afsnt_A,afsnt_D) %>% 
+  filter(SDT_MM==9|SDT_MM==10) %>% 
+  mutate(special_fit=ifelse(str_sub(FLT,-1) %in% c("T","M","F"),1,0)) %>% 
+  filter(special_fit==0) %>% 
+  select(-special_fit) %>% 
+  filter(CNL=="N")
+
+arp<-dummyVars(~ARP,data = afsnt,levelsOnly = T)
+odp<-dummyVars(~ODP,data=afsnt,levelsOnly = T)
+sdt_dy<-dummyVars(~SDT_DY,data=afsnt,levelsOnly = T)
+flo<-dummyVars(~FLO,data=afsnt,levelsOnly = T)
+afsnt<-cbind(afsnt,predict(arp,newdata=afsnt),predict(odp,newdata=afsnt),predict(sdt_dy,newdata=afsnt),predict(flo,newdata=afsnt))
+
+# Train Data - PAST DELAY 입히기
+past_tuner <- function(df){
+  df <- df %>% mutate(DATE=as.Date(paste0(SDT_YY,'-',SDT_MM,'-',SDT_DD)),
+                      TIME=as.numeric(gsub(':','',STT))) %>%
+    group_by(DATE, REG) %>% mutate(ORDER=rank(TIME)) %>% arrange(DATE, REG, TIME)
+  order <- df$ORDER; dly <- df$DLY; reg <- df$REG
+  n <- nrow(df); empty <- c()
+  for (i in 1:n){
+    if (order[i]==1|reg[i]==''){
+      empty <- empty %>% append(0)
+    }
+    else if (order[i]-1==order[i-1]){
+      if (dly[i-1]=='Y'){
+        empty <- empty %>% append(1)
+      }
+      else{
+        empty <- empty %>% append(0)
+      }
+    }
+    else {
+      empty <- empty %>% append(NA)
+    }
+  }
+  output <- cbind(df, PAST=empty) %>% as.data.frame() %>% select(-c(DATE, TIME, ORDER))
+  return(output)
+}
+
+afsnt<-past_tuner(afsnt)
+afsnt$PAST<-ifelse(is.na(afsnt$PAST),0,afsnt$PAST)
+
+third <- AFSNT %>% group_by(REG) %>% mutate(ALL=n()) %>%
+  filter(str_detect(DRR,'C')==T, DRR!='C02') %>%  
+  group_by(REG) %>% mutate(N=n(),RATE=N/ALL)
+b <- third %>% select(REG, RATE) %>% unique()
+## 0.02 0.04 0.1 etc
+# Left Skewed 된 분포를 띤다. 기체 당 정비 문제가 평균적으로 균일하게 일어나지만, 그 중에 예외로 정비 비율이 높은 기체가 존재한다.
+REG1<-b$REG[b$RATE<=0.01]
+REG2<-b$REG[b$RATE>0.01 & b$RATE <=0.04]
+REG3<-b$REG[b$RATE>0.04 ]
+
+afsnt$REG_RATE<-ifelse(afsnt$REG %in% REG1,"REG1",
+                       ifelse(afsnt$REG %in% REG2,"REG2",
+                              ifelse(afsnt$REG %in% REG3,"REG3",NA)))
+reg_rate<-dummyVars(~REG_RATE,data=afsnt,levelsOnly = T)
+nreg<-which(is.na(afsnt$REG_RATE))
+afsnt<-cbind(afsnt,predict(reg_rate,newdata=afsnt))
+for(i in nrow(nreg)){
+  afsnt$REG_RATE[i]<-0
+  afsnt$REG_RATE1[i]<-0
+  afsnt$REG_RATE2[i]<-0
+  afsnt$REG_RATE3[i]<-0
+}
+
+train_tuner <- function(df){
+  df$INDEX <- 0
+  df <- df %>% select(COMPLEXITY,APRON_SIZE,CRAFT_STAND,C02,
+                      PS_AVG,WSPD_AVG,WSPD_MAX,WSPD_INS,CA_TOT_AVG,
+                      RN_SUM,VIS_MNM,CLA,BASE,MIST,HM_INV,
+                      ARPARP1,ARPARP2,ARPARP3,ARPARP4,ARPARP5,ARPARP6,
+                      ARPARP7,ARPARP8,ARPARP9,ARPARP11,ARPARP12,
+                      ARPARP13,ARPARP14,ARPARP15,
+                      ODPARP1,ODPARP2,ODPARP3,ODPARP4,ODPARP5,ODPARP6,
+                      ODPARP7,ODPARP8,ODPARP9,ODPARP11,ODPARP12,
+                      ODPARP13,ODPARP14,ODPARP15,
+                      SDT_DY월,SDT_DY화,SDT_DY수,SDT_DY목,SDT_DY금,
+                      SDT_DY토,SDT_DY일,
+                      FLOA,FLOB,FLOF,FLOH,FLOI,FLOJ,FLOL,
+                      PAST,REG_RATEREG1,REG_RATEREG2,REG_RATEREG3,
+                      INDEX,DLY,REG,SDT_DD,STT)
+  return(df)
+}
+
+colnames(train_tuner(afsnt))
+# write.csv(afsnt,"train_model.csv",row.names=F)
+```
+
+  
+## 테스트 데이터
+
+AFSNT_DLY에 생성된 변수들을 추가해야 합니다.
+
+### forecast weather
+
+시계열 분석을 통해 9월 16일부터 9월 30일 까지의 날씨를 예측했습니다.
+  
+```{r forecast weather }
+### ARP15(incheon)
+dat_list_sep<-list()
+for(i in 1:18){
+  wd<-"./data/forecast/ARP15/"
+  if(i<10){
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_200",i,"09_RKSI.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP15",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  } else {
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_20",i,"09_RKSI.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP15",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  }
+}
+weather_forecast_arp15<-rbind(dat_list_sep[[1]],dat_list_sep[[2]],dat_list_sep[[3]],dat_list_sep[[4]],dat_list_sep[[5]],dat_list_sep[[6]],dat_list_sep[[7]],dat_list_sep[[8]],dat_list_sep[[9]],dat_list_sep[[10]],dat_list_sep[[11]],dat_list_sep[[12]],dat_list_sep[[13]],dat_list_sep[[14]],dat_list_sep[[15]],dat_list_sep[[16]],dat_list_sep[[17]],dat_list_sep[[18]]) %>% 
+  filter(DATE>=16) %>% 
+  select(-c(CLF,SD_MAX,WD_MAX,WD_INS))
+weather_forecast_arp15_ts<-list()
+weather_forecast_arp15_arima<-list()
+weather_forecast_arp15_pred<-list()
+weather_forecast_arp15_predict<-data.frame(ARP="ARP15",DATE=c(16:30))
+# par(mfrow=c(5,5))
+for(i in c("PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")){
+  weather_forecast_arp15_ts[[i]]<-ts(weather_forecast_arp15[,i],start = c(2001,1),frequency = 15)
+  weather_forecast_arp15_arima[[i]]<-arima(weather_forecast_arp15_ts[[i]],c(2,0,0))
+  pred<-predict(weather_forecast_arp15_arima[[i]],n.ahead=15)
+  weather_forecast_arp15_pred[[i]]<-pred$pred
+  weather_forecast_arp15_predict<-cbind(weather_forecast_arp15_predict,as.numeric(weather_forecast_arp15_pred[[i]]))
+}
+colnames(weather_forecast_arp15_predict)<-c("ARP","DATE","PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")
+## time seires plot
+ts.plot(weather_forecast_arp15_ts[[1]],weather_forecast_arp15_pred[[1]],lty=c(1,3),col="darkslategray3",main="Time-Series plot of PS_AVG")
+## 최대한 수렴하는 값을 없애려고 16~30일로 제한
+
+### ARP3(jeju)
+dat_list_sep<-list()
+for(i in 1:18){
+  wd<-"./data/forecast/ARP3/"
+  if(i<10){
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_200",i,"09_RKPC.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP3",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  } else {
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_20",i,"09_RKPC.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP3",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  }
+}
+weather_forecast_arp3<-rbind(dat_list_sep[[1]],dat_list_sep[[2]],dat_list_sep[[3]],dat_list_sep[[4]],dat_list_sep[[5]],dat_list_sep[[6]],dat_list_sep[[7]],dat_list_sep[[8]],dat_list_sep[[9]],dat_list_sep[[10]],dat_list_sep[[11]],dat_list_sep[[12]],dat_list_sep[[13]],dat_list_sep[[14]],dat_list_sep[[15]],dat_list_sep[[16]],dat_list_sep[[17]],dat_list_sep[[18]]) %>% 
+  filter(DATE>=16) %>% 
+  select(-c(CLF,SD_MAX,WD_MAX,WD_INS))
+weather_forecast_arp3_ts<-list()
+weather_forecast_arp3_arima<-list()
+weather_forecast_arp3_pred<-list()
+weather_forecast_arp3_predict<-data.frame(ARP="ARP3",DATE=c(16:30))
+# par(mfrow=c(5,5))
+for(i in c("PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")){
+  weather_forecast_arp3_ts[[i]]<-ts(weather_forecast_arp3[,i],start = c(2001,1),frequency = 15)
+  weather_forecast_arp3_arima[[i]]<-arima(weather_forecast_arp3_ts[[i]],c(2,0,0))
+  pred<-predict(weather_forecast_arp3_arima[[i]],n.ahead=15)
+  weather_forecast_arp3_pred[[i]]<-pred$pred
+  weather_forecast_arp3_predict<-cbind(weather_forecast_arp3_predict,as.numeric(weather_forecast_arp3_pred[[i]]))
+  # ts.plot(weather_forecast_arp15_ts[[i]],pred$pred,lty=c(1,3))
+}
+colnames(weather_forecast_arp3_predict)<-c("ARP","DATE","PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")
+
+
+### ARP1(kimpo)
+dat_list_sep<-list()
+for(i in 1:18){
+  wd<-"./data/forecast/ARP1/"
+  if(i<10){
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_200",i,"09_RKSS.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP1",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  } else {
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_20",i,"09_RKSS.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP1",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  }
+}
+weather_forecast_arp1<-rbind(dat_list_sep[[1]],dat_list_sep[[2]],dat_list_sep[[3]],dat_list_sep[[4]],dat_list_sep[[5]],dat_list_sep[[6]],dat_list_sep[[7]],dat_list_sep[[8]],dat_list_sep[[9]],dat_list_sep[[10]],dat_list_sep[[11]],dat_list_sep[[12]],dat_list_sep[[13]],dat_list_sep[[14]],dat_list_sep[[15]],dat_list_sep[[16]],dat_list_sep[[17]],dat_list_sep[[18]]) %>% 
+  filter(DATE>=16) %>% 
+  select(-c(CLF,SD_MAX,WD_MAX,WD_INS))
+weather_forecast_arp1_ts<-list()
+weather_forecast_arp1_arima<-list()
+weather_forecast_arp1_pred<-list()
+weather_forecast_arp1_predict<-data.frame(ARP="ARP1",DATE=c(16:30))
+# par(mfrow=c(5,5))
+for(i in c("PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")){
+  weather_forecast_arp1_ts[[i]]<-ts(weather_forecast_arp15[,i],start = c(2001,1),frequency = 15)
+  weather_forecast_arp1_arima[[i]]<-arima(weather_forecast_arp1_ts[[i]],c(2,0,0))
+  pred<-predict(weather_forecast_arp1_arima[[i]],n.ahead=15)
+  weather_forecast_arp1_pred[[i]]<-pred$pred
+  weather_forecast_arp1_predict<-cbind(weather_forecast_arp1_predict,as.numeric(weather_forecast_arp1_pred[[i]]))
+  # ts.plot(weather_forecast_arp15_ts[[i]],pred$pred,lty=c(1,3))
+}
+colnames(weather_forecast_arp1_predict)<-c("ARP","DATE","PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")
+
+### ARP7(muan)
+dat_list_sep<-list()
+for(i in 8:18){
+  wd<-"./data/forecast/ARP7/"
+  if(i<10){
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_200",i,"09_RKJB.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP7",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  } else {
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_20",i,"09_RKJB.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP7",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  }
+}
+weather_forecast_arp7<-rbind(dat_list_sep[[1]],dat_list_sep[[2]],dat_list_sep[[3]],dat_list_sep[[4]],dat_list_sep[[5]],dat_list_sep[[6]],dat_list_sep[[7]],dat_list_sep[[8]],dat_list_sep[[9]],dat_list_sep[[10]],dat_list_sep[[11]],dat_list_sep[[12]],dat_list_sep[[13]],dat_list_sep[[14]],dat_list_sep[[15]],dat_list_sep[[16]],dat_list_sep[[17]],dat_list_sep[[18]]) %>% 
+  filter(DATE>=16) %>% 
+  select(-c(CLF,SD_MAX,WD_MAX,WD_INS))
+weather_forecast_arp7_ts<-list()
+weather_forecast_arp7_arima<-list()
+weather_forecast_arp7_pred<-list()
+weather_forecast_arp7_predict<-data.frame(ARP="ARP7",DATE=c(16:30))
+# par(mfrow=c(5,5))
+for(i in c("PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")){
+  weather_forecast_arp7_ts[[i]]<-ts(weather_forecast_arp7[,i],start = c(2001,1),frequency = 15)
+  weather_forecast_arp7_arima[[i]]<-arima(weather_forecast_arp15_ts[[i]],c(2,0,0))
+  pred<-predict(weather_forecast_arp7_arima[[i]],n.ahead=15)
+  weather_forecast_arp7_pred[[i]]<-pred$pred
+  weather_forecast_arp7_predict<-cbind(weather_forecast_arp7_predict,as.numeric(weather_forecast_arp7_pred[[i]]))
+  # ts.plot(weather_forecast_arp15_ts[[i]],pred$pred,lty=c(1,3))
+}
+colnames(weather_forecast_arp7_predict)<-c("ARP","DATE","PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")
+
+### ARP5(ulsan)
+dat_list_sep<-list()
+for(i in 1:18){
+  wd<-"./data/forecast/ARP5/"
+  if(i<10){
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_200",i,"09_RKPU.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP5",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  } else {
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_20",i,"09_RKPU.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP5",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  }
+}
+weather_forecast_arp5<-rbind(dat_list_sep[[1]],dat_list_sep[[2]],dat_list_sep[[3]],dat_list_sep[[4]],dat_list_sep[[5]],dat_list_sep[[6]],dat_list_sep[[7]],dat_list_sep[[8]],dat_list_sep[[9]],dat_list_sep[[10]],dat_list_sep[[11]],dat_list_sep[[12]],dat_list_sep[[13]],dat_list_sep[[14]],dat_list_sep[[15]],dat_list_sep[[16]],dat_list_sep[[17]],dat_list_sep[[18]]) %>% 
+  filter(DATE>=16) %>% 
+  select(-c(CLF,SD_MAX,WD_MAX,WD_INS))
+weather_forecast_arp5_ts<-list()
+weather_forecast_arp5_arima<-list()
+weather_forecast_arp5_pred<-list()
+weather_forecast_arp5_predict<-data.frame(ARP="ARP5",DATE=c(16:30))
+# par(mfrow=c(5,5))
+for(i in c("PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")){
+  weather_forecast_arp5_ts[[i]]<-ts(weather_forecast_arp5[,i],start = c(2001,1),frequency = 15)
+  weather_forecast_arp5_arima[[i]]<-arima(weather_forecast_arp5_ts[[i]],c(2,0,0))
+  pred<-predict(weather_forecast_arp5_arima[[i]],n.ahead=15)
+  weather_forecast_arp5_pred[[i]]<-pred$pred
+  weather_forecast_arp5_predict<-cbind(weather_forecast_arp5_predict,as.numeric(weather_forecast_arp5_pred[[i]]))
+  # ts.plot(weather_forecast_arp15_ts[[i]],pred$pred,lty=c(1,3))
+}
+colnames(weather_forecast_arp5_predict)<-c("ARP","DATE","PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")
+
+### ARP10(yang)
+dat_list_sep<-list()
+for(i in 2:18){
+  wd<-"./data/forecast/ARP10/"
+  if(i<10){
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_200",i,"09_RKNY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP10",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  } else {
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_20",i,"09_RKNY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP10",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  }
+}
+weather_forecast_arp10<-rbind(dat_list_sep[[1]],dat_list_sep[[2]],dat_list_sep[[3]],dat_list_sep[[4]],dat_list_sep[[5]],dat_list_sep[[6]],dat_list_sep[[7]],dat_list_sep[[8]],dat_list_sep[[9]],dat_list_sep[[10]],dat_list_sep[[11]],dat_list_sep[[12]],dat_list_sep[[13]],dat_list_sep[[14]],dat_list_sep[[15]],dat_list_sep[[16]],dat_list_sep[[17]],dat_list_sep[[18]]) %>% 
+  filter(DATE>=16) %>% 
+  select(-c(CLF,SD_MAX,WD_MAX,WD_INS))
+weather_forecast_arp10_ts<-list()
+weather_forecast_arp10_arima<-list()
+weather_forecast_arp10_pred<-list()
+weather_forecast_arp10_predict<-data.frame(ARP="ARP10",DATE=c(16:30))
+# par(mfrow=c(5,5))
+for(i in c("PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")){
+  weather_forecast_arp10_ts[[i]]<-ts(weather_forecast_arp10[,i],start = c(2001,1),frequency = 15)
+  weather_forecast_arp10_arima[[i]]<-arima(weather_forecast_arp10_ts[[i]],c(2,0,0))
+  pred<-predict(weather_forecast_arp10_arima[[i]],n.ahead=15)
+  weather_forecast_arp10_pred[[i]]<-pred$pred
+  weather_forecast_arp10_predict<-cbind(weather_forecast_arp10_predict,as.numeric(weather_forecast_arp10_pred[[i]]))
+  # ts.plot(weather_forecast_arp15_ts[[i]],pred$pred,lty=c(1,3))
+}
+colnames(weather_forecast_arp10_predict)<-c("ARP","DATE","PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")
+
+### ARP9(yusu)
+dat_list_sep<-list()
+for(i in 1:18){
+  wd<-c("./data/forecast/ARP9/")
+  if(i<10){
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_200",i,"09_RKJY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP9",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  } else {
+    dat_list_sep[[i]]<-read.csv(paste0(wd,"MONTH_20",i,"09_RKJY.csv"),header = T,fileEncoding = "UTF8",stringsAsFactors = F)
+    dat_list_sep[[i]]<-cbind((2000+i),9,"ARP9",dat_list_sep[[i]])
+    colnames(dat_list_sep[[i]])[c(1,2,3)]<-c("SDT_YY","SDT_MM","ARP")
+    dat_list_sep[[i]]$RN_SUM<-ifelse(is.na(dat_list_sep[[i]]$RN_SUM),0,dat_list_sep[[i]]$RN_SUM)
+    dat_list_sep[[i]]$SD_MAX<-ifelse(is.na(dat_list_sep[[i]]$SD_MAX),0,dat_list_sep[[i]]$SD_MAX)
+    dat_list_sep[[i]]$VIS_MNM<-ifelse(is.na(dat_list_sep[[i]]$VIS_MNM),1000,dat_list_sep[[i]]$VIS_MNM)
+    dat_list_sep[[i]]$CLA<-ifelse(is.na(dat_list_sep[[i]]$CLA),0,dat_list_sep[[i]]$CLA)
+    dat_list_sep[[i]]$BASE<-ifelse(is.na(dat_list_sep[[i]]$BASE),0,dat_list_sep[[i]]$BASE)
+  }
+}
+weather_forecast_arp9<-rbind(dat_list_sep[[1]],dat_list_sep[[2]],dat_list_sep[[3]],dat_list_sep[[4]],dat_list_sep[[5]],dat_list_sep[[6]],dat_list_sep[[7]],dat_list_sep[[8]],dat_list_sep[[9]],dat_list_sep[[10]],dat_list_sep[[11]],dat_list_sep[[12]],dat_list_sep[[13]],dat_list_sep[[14]],dat_list_sep[[15]],dat_list_sep[[16]],dat_list_sep[[17]],dat_list_sep[[18]]) %>% 
+  filter(DATE>=16) %>% 
+  select(-c(CLF,SD_MAX,WD_MAX,WD_INS))
+weather_forecast_arp9_ts<-list()
+weather_forecast_arp9_arima<-list()
+weather_forecast_arp9_pred<-list()
+weather_forecast_arp9_predict<-data.frame(ARP="ARP9",DATE=c(16:30))
+# par(mfrow=c(5,5))
+for(i in c("PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")){
+  weather_forecast_arp9_ts[[i]]<-ts(weather_forecast_arp9[,i],start = c(2001,1),frequency = 15)
+  weather_forecast_arp9_arima[[i]]<-arima(weather_forecast_arp9_ts[[i]],c(2,0,0))
+  pred<-predict(weather_forecast_arp9_arima[[i]],n.ahead=15)
+  weather_forecast_arp9_pred[[i]]<-pred$pred
+  weather_forecast_arp9_predict<-cbind(weather_forecast_arp9_predict,as.numeric(weather_forecast_arp9_pred[[i]]))
+  # ts.plot(weather_forecast_arp15_ts[[i]],pred$pred,lty=c(1,3))
+}
+colnames(weather_forecast_arp9_predict)<-c("ARP","DATE","PS_AVG","TMP_AVG","TMP_MAX","TMP_MNM","TD_AVG","HM_AVG","HM_MNM","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE")
+
+## export the data
+# write.csv(weather_forecast_arp1,"weather_forecast_arp1.csv",row.names = F)
+# write.csv(weather_forecast_arp3,"weather_forecast_arp3.csv",row.names = F)
+# write.csv(weather_forecast_arp5,"weather_forecast_arp5.csv",row.names = F)
+# write.csv(weather_forecast_arp7,"weather_forecast_arp7.csv",row.names = F)
+# write.csv(weather_forecast_arp9,"weather_forecast_arp9.csv",row.names = F)
+# write.csv(weather_forecast_arp10,"weather_forecast_arp10.csv",row.names = F)
+# write.csv(weather_forecast_arp15,"weather_forecast_arp15.csv",row.names = F)
+
+weather_forecast_predict<-rbind(weather_forecast_arp1_predict,weather_forecast_arp3_predict,weather_forecast_arp5_predict,weather_forecast_arp7_predict,weather_forecast_arp9_predict,weather_forecast_arp10_predict,weather_forecast_arp15_predict) %>% 
+  mutate(MIST=TMP_MNM-TD_AVG,HM_INV=1/HM_AVG) %>% 
+  select(-c(TMP_AVG,TMP_MAX,TMP_MNM,TD_AVG,HM_AVG,HM_MNM))
+colnames(weather_forecast_predict)<-c("ARP","DATE","PS_AVG","WSPD_AVG","WSPD_MAX","WSPD_INS","CA_TOT_AVG","RN_SUM","VIS_MNM","CLA","BASE","MIST","HM_INV")
+# write.csv(weather_forecast_predict,"weather_forecast_predict.csv",row.names=F)
+```
+
+```{r make test data }
+AFSNT<-fread("./data/AFSNT.csv",header = T,stringsAsFactors = F); afsnt<-AFSNT
+AFSNT_DLY<-fread("./data/AFSNT_DLY.csv",header = T,stringsAsFactors = F)
+AFSNT_DLY[3,5]<-"ARP1"
+weather_forecast<-fread("./data/weather_forecast_predict.csv",header = T,stringsAsFactors = F)
+prop_C02_A<-fread("./data/Proportion_C02_A.csv",header = T,stringsAsFactors = F)
+prop_C02_D<-fread("./data/Proportion_C02_D.csv",header = T,stringsAsFactors = F)
+airport <- fread("./data/airport_data.csv",header = T,stringsAsFactors = F)
+
+
+afsnt <- afsnt %>% mutate(DATE=as_date(paste(SDT_YY,'-',SDT_MM,'-',SDT_DD)),
+                          SCT=as.integer(gsub(':','',STT)), # 순서를 매기기 위해
+                          STT2=hm(STT), # 시-분 형태로 표현
+                          ATT2=hm(ATT), # 시-분 형태로 표현
+                          DIF=ATT2-STT2) # 지연된 시간
+afsnt$DIF <- afsnt$DIF@hour*60 + afsnt$DIF@minute # 분으로 표현
+afsnt <- afsnt %>% select(-c(STT2, ATT2))
+###afsnt DLY 시간 날짜 정리
+
+AFSNT_DLY <- AFSNT_DLY %>% mutate(DATE=as_date(paste(SDT_YY,'-',SDT_MM,'-',SDT_DD)),
+                                  SCT=as.integer(gsub(':','',STT)),
+                                  INDEX=1:nrow(AFSNT_DLY))
+
+#######################
+# SFSNT 와 AFSNT 를 통한 REG 의 루틴을 Test data 에 적용 
+
+#######train data  REG  - Test data 에 입히기
+#최신 train data 일정 뽑기 - 2019년 6월 마지막주의 FLT를 통하여..
+AFSNT_DLY$DY_FLT <- paste0(AFSNT_DLY$SDT_DY,AFSNT_DLY$FLT,AFSNT_DLY$AOD)
+
+latest_afsnt <- afsnt %>% filter(DATE>='2019-06-24')
+latest_afsnt$DY_FLT <- paste0(latest_afsnt$SDT_DY,latest_afsnt$FLT,latest_afsnt$AOD) 
+
+latest_afsnt <- latest_afsnt %>% select(DY_FLT,REG) 
+
+#AFSNT 와 최신 일정 을 JOIN 한 , AFSNT_DLY_join 이라는 새로운 데이터 프레임 생성
+AFSNT_DLY_join <- left_join(AFSNT_DLY,latest_afsnt, by= 'DY_FLT') %>% arrange(INDEX)
+AFSNT_DLY_join$REG[is.na(AFSNT_DLY_join$REG)] <- ""
+
+#### (최신 항공편) 6월 마지막 주에 없는 항공편 채워 넣기
+#  REG가 정해지지 않은 항공편만 뽑아내기 
+NAREG <- AFSNT_DLY_join %>%  filter(AFSNT_DLY_join$REG=="")
+NAREG <- NAREG[,1:16] # reg 컴럼 삭제 
+
+#########
+#REG가 정해지지 않은 FLT들만 뽑아 내어  6월 셋쨰 주 운항 일정 입히기 
+#셋쨰 주 선택 
+
+W3_afsnt <- afsnt %>% filter(DATE>='2019-06-16',DATE<='2019-06-22')
+W3_afsnt$DY_FLT <- paste0(W3_afsnt$SDT_DY,W3_afsnt$FLT,W3_afsnt$AOD) 
+W3_afsnt <- W3_afsnt %>% select(REG, DY_FLT)
+
+#NA REG와 합치기 
+NA_REG_join <- left_join(NAREG,W3_afsnt, by= 'DY_FLT') %>% arrange(INDEX)
+
+NA_REG_join$DATE_FLT_AOD <- paste0(NA_REG_join$DATE,NA_REG_join$FLT,NA_REG_join$AOD)
+NA_REG_join <-NA_REG_join %>% select(DATE_FLT_AOD,REG)
+
+AFSNT_DLY_join$DATE_FLT_AOD <- paste0(AFSNT_DLY_join$DATE,AFSNT_DLY_join$FLT,AFSNT_DLY_join$AOD)
+
+# 셋쨰주 운항 일정으로 새롭게 찾은 정보들을 원본파일에 합치기 
+AFSNT_DLY_join <- left_join(AFSNT_DLY_join,NA_REG_join,by='DATE_FLT_AOD')
+
+AFSNT_DLY_join$REG.x[is.na(AFSNT_DLY_join$REG.x)] <- ""
+AFSNT_DLY_join$REG.y[is.na(AFSNT_DLY_join$REG.y)] <- ""
+
+AFSNT_DLY_join$REG.x<-ifelse(AFSNT_DLY_join$REG.x=="",AFSNT_DLY_join$REG.y,AFSNT_DLY_join$REG.x)
+
+AFSNT_DLY_join<- AFSNT_DLY_join[,-c(18,19)] # reg y  & 불필요 칼럼 삭제
+names(AFSNT_DLY_join)[names(AFSNT_DLY_join) == "REG.x"] <- c("REG") 
+
+###########
+###### 같은 FLT 에 다수의 REG 가 있는 경우는 확실한 정보가 아니므로 공백 처리 
+AFSNT_DLY_join$DATE_DY_FLT <- paste0(AFSNT_DLY_join$DATE,AFSNT_DLY_join$DY_FLT)
+AFSNT_DLY_join$idx <-  1:nrow(AFSNT_DLY_join)
+
+
+dup_del <-AFSNT_DLY_join[-which(duplicated(AFSNT_DLY_join$DATE_DY_FLT)),]
+anti_del <- anti_join(AFSNT_DLY_join,dup_del, by = 'idx')
+anti_del_idx <- anti_join(AFSNT_DLY_join,dup_del, by = 'idx') %>% select(idx)
+
+dup_del$REG <- ifelse(dup_del$idx %in% anti_del_idx, dup_del$REG=="",dup_del$REG)
+
+dup_del<-dup_del %>% select(-c(DY_FLT,DATE_DY_FLT,idx,DATE,SCT))
+
+afsnt_dly<-dup_del
+
+## complex
+  arp_tuner <- function(df,i){
+    afsnt_d <- df %>% filter(AOD=='D' & ARP==paste0('ARP',i))
+    afsnt_a <- df %>% filter(AOD=='A' & ARP==paste0('ARP',i))
+    afsnt_arp <- rbind(afsnt_d, afsnt_a)
+    afsnt_arp <- afsnt_arp %>% select(SDT_YY,SDT_MM,SDT_DD,STT,ARP,ODP,AOD,FLT) %>%
+      mutate(STTT=paste(SDT_YY,SDT_MM,SDT_DD,STT,sep=':'),
+             POSIX=as.POSIXct(STTT,format='%Y:%m:%d:%H:%M')) %>% arrange(POSIX)
+    afsnt_arp$schedule <- strptime(afsnt_arp$STTT,'%Y:%m:%d:%H:%M')
+    schedule_time <- afsnt_arp$schedule$hour*60 + afsnt_arp$schedule$min
+    COMPLEXITY <- c(1); tmp <- 1; cnt <- 0
+    for (i in 2:nrow(afsnt_arp)){
+      if(afsnt_arp$schedule[i]$mday!=afsnt_arp$schedule[i-1]$mday){
+        tmp <- i; COMPLEXITY[i] <- 1
+      } else{
+        cnt <- 0
+        for (j in tmp:i){
+          if(schedule_time[i] - schedule_time[j] <= 60){
+            cnt <- cnt+1
+          }
+        }
+        COMPLEXITY[i] <- cnt
+      }
+    }
+    afsnt_arp <- cbind(afsnt_arp, COMPLEXITY) %>% select(-c('POSIX','STTT','schedule'))
+    return(afsnt_arp)
+  }
+  
+  COMPLEXITY <- arp_tuner(afsnt_dly,1)
+  for (i in 2:15){
+    COMPLEXITY <- rbind(COMPLEXITY, arp_tuner(afsnt_dly,i))
+  }
+  
+  afsnt_dly<-left_join(afsnt_dly,COMPLEXITY,by=c("SDT_YY","SDT_MM","SDT_DD","STT","ARP","ODP","AOD","FLT"))
+
+## airport data
+afsnt_dly<-left_join(afsnt_dly,airport,by=c("ARP","SDT_YY"))
+
+## devide AOD = A or D
+afsnt_dly_D<-afsnt_dly %>% filter(AOD=="D")
+afsnt_dly_A<-afsnt_dly %>% filter(AOD=="A")
+
+## prop C02, AOD=A
+afsnt_dly_A$schedule<-strptime(afsnt_dly_A$STT,"%H:%M")
+afsnt_dly_A$timeslot<-afsnt_dly_A$schedule$hour
+afsnt_dly_A<-left_join(afsnt_dly_A %>% select(-schedule), prop_C02_A ,by=c("ARP","timeslot"))
+
+afsnt_dly_A <- afsnt_dly_A %>% select(-c(timeslot,n,DLY_sum,DRR_C02)) %>%dplyr::rename(C02=prop_C02)
+
+afsnt_dly_A$C02<-ifelse(is.na(afsnt_dly_A$C02),0,afsnt_dly_A$C02)
+
+## prop C02, AOD=D
+afsnt_dly_D$schedule<-strptime(afsnt_dly_D$STT,"%H:%M")
+afsnt_dly_D$timeslot<-afsnt_dly_D$schedule$hour
+afsnt_dly_D<-left_join(afsnt_dly_D %>% select(-schedule),prop_C02_D,by=c("ARP","timeslot")) %>% 
+  select(-c(timeslot,n,DLY_sum,DRR_C02,prop_DLY)) %>% 
+  dplyr::rename(C02=prop_C02)
+afsnt_dly_D$C02<-ifelse(is.na(afsnt_dly_D$C02),0,afsnt_dly_D$C02)
+
+afsnt_dly_D$ARP_fake <- ifelse(afsnt_dly_D$ARP %in% c("ARP2","ARP4","ARP11"),"ARP5",
+                         ifelse(afsnt_dly_D$ARP %in% c("ARP8","ARP12"),"ARP9",
+                                ifelse(afsnt_dly_D$ARP=="ARP6","ARP15",
+                                       ifelse(afsnt_dly_D$ARP=="ARP13","ARP7",
+                                              ifelse(afsnt_dly_D$ARP=="ARP14","ARP10",afsnt_dly_D$ARP)))))
+
+afsnt_dly_A$ODP_fake<-ifelse(afsnt_dly_A$ODP %in% c("ARP2","ARP4","ARP11"),"ARP5",
+                         ifelse(afsnt_dly_A$ODP %in% c("ARP8","ARP12"),"ARP9",
+                                ifelse(afsnt_dly_A$ODP=="ARP6","ARP15",
+                                       ifelse(afsnt_dly_A$ODP=="ARP13","ARP7",
+                                              ifelse(afsnt_dly_A$ODP=="ARP14","ARP10",afsnt_dly_A$ODP)))))
+
+afsnt_dly_D <- left_join(afsnt_dly_D,weather_forecast,by=c("ARP_fake"="ARP","SDT_DD"="DATE")) %>% select(-ARP_fake)
+afsnt_dly_A<-left_join(afsnt_dly_A,weather_forecast,by=c("ODP_fake"="ARP","SDT_DD"="DATE")) %>% select(-ODP_fake)
+afsnt_dly<-rbind(afsnt_dly_A,afsnt_dly_D)
+
+arp<-dummyVars(~ARP,data = afsnt_dly,levelsOnly = T)
+odp<-dummyVars(~ODP,data=afsnt_dly,levelsOnly = T)
+sdt_dy<-dummyVars(~SDT_DY,data=afsnt_dly,levelsOnly = T)
+flo<-dummyVars(~FLO,data=afsnt_dly,levelsOnly = T)
+afsnt_dly<-cbind(afsnt_dly,predict(arp,newdata=afsnt_dly),predict(odp,newdata=afsnt_dly),predict(sdt_dy,newdata=afsnt_dly),predict(flo,newdata=afsnt_dly))
+afsnt_dly$PAST<-0
+
+third <- AFSNT %>% group_by(REG) %>% mutate(ALL=n()) %>%
+  filter(str_detect(DRR,'C')==T, DRR!='C02') %>%  
+  group_by(REG) %>% mutate(N=n(),RATE=N/ALL)
+b <- third %>% select(REG, RATE) %>% unique()
+## 0.02 0.04 0.1 etc
+# Left Skewed 된 분포를 띤다. 기체 당 정비 문제가 평균적으로 균일하게 일어나지만, 그 중에 예외로 정비 비율이 높은 기체가 존재한다.
+REG1<-b$REG[b$RATE<=0.01]
+REG2<-b$REG[b$RATE>0.01 & b$RATE <=0.04]
+REG3<-b$REG[b$RATE>0.04 ]
+afsnt_dly$REG_RATE<-ifelse(afsnt_dly$REG %in% REG1,"REG1",
+                       ifelse(afsnt_dly$REG %in% REG2,"REG2",
+                              ifelse(afsnt_dly$REG %in% REG3,"REG3",NA)))
+
+reg_rate<-dummyVars(~REG_RATE,data=afsnt_dly,levelsOnly = T)
+afsnt_dly<-cbind(afsnt_dly,predict(reg_rate,newdata=afsnt_dly))
+
+nreg<-which(is.na(afsnt_dly$REG_RATE))
+for(i in nreg){
+  afsnt_dly$REG_RATE[i]<-0
+  afsnt_dly$REG_RATEREG1[i]<-0
+  afsnt_dly$REG_RATEREG2[i]<-0
+  afsnt_dly$REG_RATEREG3[i]<-0
+}
+
+afsnt_dly<-afsnt_dly %>% 
+  select(-c(ARPARP10,ODPARP10)) %>% 
+  arrange(INDEX)
+
+test_tuner <- function(df){
+  df <- df %>% select(COMPLEXITY,APRON_SIZE,CRAFT_STAND,C02,
+                      PS_AVG,WSPD_AVG,WSPD_MAX,WSPD_INS,CA_TOT_AVG,
+                      RN_SUM,VIS_MNM,CLA,BASE,MIST,HM_INV,
+                      ARPARP1,ARPARP2,ARPARP3,ARPARP4,ARPARP5,ARPARP6,
+                      ARPARP7,ARPARP8,ARPARP9,ARPARP11,ARPARP12,
+                      ARPARP13,ARPARP14,ARPARP15,
+                      ODPARP1,ODPARP2,ODPARP3,ODPARP4,ODPARP5,ODPARP6,
+                      ODPARP7,ODPARP8,ODPARP9,ODPARP11,ODPARP12,
+                      ODPARP13,ODPARP14,ODPARP15,
+                      SDT_DY월,SDT_DY화,SDT_DY수,SDT_DY목,SDT_DY금,
+                      SDT_DY토,SDT_DY일,
+                      FLOA,FLOB,FLOF,FLOH,FLOI,FLOJ,FLOL,
+                      PAST,REG_RATEREG1,REG_RATEREG2,REG_RATEREG3,
+                      INDEX,DLY,REG,SDT_DD,STT)
+  return(df)
+}
+
+colnames(test_tuner(afsnt_dly) %>% select(-c(INDEX,DLY,REG,SDT_DD,STT)))
+# write.csv(afsnt_dly,"afsnt_dly_predict.csv",row.names = F)
+```
+
+## 부트스트랩
+
+지연 여부가 약 1:7의 불균형 자료이기 때문에 균형 있게 샘플링하기 위해
+
+로즈 기법을 사용했습니다.
+
+#### 로즈기법
+
+로즈: ROSE (Random Over-Sampling Examples) 
+
+불균형 데이터에서 사용하는 기법으로써  
+
+두 그룹에 대해서 조건부 확률 분포를 통해 새로운 샘플들을 생성하는 부트스트래핑 기법입니다. 
+  
+```{r ready to modeling}
+train <- fread("./data/train_model.csv",header=T,stringsAsFactors=F) %>% 
+  mutate(DLY=ifelse(DLY=="Y",1,0))
+test <- fread('./data/afsnt_dly_predict.csv',header=T,stringsAsFactors=F) %>% 
+  mutate(DLY=ifelse(DLY=="Y",1,0))
+afsnt_dly <- fread('./data/afsnt_dly.csv',header=T,stringsAsFactors=F) %>% select(-c(DLY, DLY_RATE))
+afsnt_dly$INDEX <- 1:nrow(afsnt_dly)
+
+normalize <- function(x){
+  return((x - min(x))/(max(x)-min(x)))
+}
+
+train_tuner <- function(df){
+  df$INDEX <- 0
+  df <- df %>% select(COMPLEXITY,APRON_SIZE,CRAFT_STAND,C02,
+                      PS_AVG,WSPD_AVG,WSPD_MAX,WSPD_INS,CA_TOT_AVG,
+                      RN_SUM,VIS_MNM,CLA,BASE,MIST,HM_INV,
+                      ARPARP1,ARPARP2,ARPARP3,ARPARP4,ARPARP5,ARPARP6,
+                      ARPARP7,ARPARP8,ARPARP9,ARPARP11,ARPARP12,
+                      ARPARP13,ARPARP14,ARPARP15,
+                      ODPARP1,ODPARP2,ODPARP3,ODPARP4,ODPARP5,ODPARP6,
+                      ODPARP7,ODPARP8,ODPARP9,ODPARP11,ODPARP12,
+                      ODPARP13,ODPARP14,ODPARP15,
+                      SDT_DY월,SDT_DY화,SDT_DY수,SDT_DY목,SDT_DY금,
+                      SDT_DY토,SDT_DY일,
+                      FLOA,FLOB,FLOF,FLOH,FLOI,FLOJ,FLOL,
+                      PAST,REG_RATEREG1,REG_RATEREG2,REG_RATEREG3,
+                      INDEX,DLY,REG,SDT_DD,STT)
+  return(df)
+}
+
+test_tuner <- function(df){
+  df <- df %>% select(COMPLEXITY,APRON_SIZE,CRAFT_STAND,C02,
+                      PS_AVG,WSPD_AVG,WSPD_MAX,WSPD_INS,CA_TOT_AVG,
+                      RN_SUM,VIS_MNM,CLA,BASE,MIST,HM_INV,
+                      ARPARP1,ARPARP2,ARPARP3,ARPARP4,ARPARP5,ARPARP6,
+                      ARPARP7,ARPARP8,ARPARP9,ARPARP11,ARPARP12,
+                      ARPARP13,ARPARP14,ARPARP15,
+                      ODPARP1,ODPARP2,ODPARP3,ODPARP4,ODPARP5,ODPARP6,
+                      ODPARP7,ODPARP8,ODPARP9,ODPARP11,ODPARP12,
+                      ODPARP13,ODPARP14,ODPARP15,
+                      SDT_DY월,SDT_DY화,SDT_DY수,SDT_DY목,SDT_DY금,
+                      SDT_DY토,SDT_DY일,
+                      FLOA,FLOB,FLOF,FLOH,FLOI,FLOJ,FLOL,
+                      PAST,REG_RATEREG1,REG_RATEREG2,REG_RATEREG3,
+                      INDEX,DLY,REG,SDT_DD,STT)
+  return(df)
+}
+
+tuned_train <- train_tuner(train)
+tuned_test <- test_tuner(test)
+
+tuned_train$label <- 'train'
+tuned_test$label <- 'test'
+pool <- rbind(tuned_train, tuned_test)
+
+pool_norm <- cbind(as.data.frame(lapply(pool[,1:61], normalize)),
+                   INDEX=pool$INDEX,
+                   DLY=pool$DLY,
+                   REG=pool$REG,
+                   SDT_DD=pool$SDT_DD,
+                   STT=pool$STT,
+                   label=pool$label)
+
+train_norm <- pool_norm %>% filter(label=='train') %>% select(-label)
+test_norm <- pool_norm %>% filter(label=='test') %>% select(-label)
+
+train <- train_norm %>% select(-c(INDEX,REG,SDT_DD,STT))
+
+train_temp <- list()
+train_actual <- list()
+test_temp <- list()
+table(train$DLY)
+for (k in 1:5){
+  train_temp[[k]] <- ovun.sample(DLY~., data=train, N=5000, method="both", p=0.3, seed=k)$data
+  train_actual[[k]] <- ovun.sample(DLY~., data=train, N=10000, method="both", p=0.3, seed=k)$data
+}
+for (k in 1:5){
+  set.seed(k)
+  idx <- sample(1:nrow(train), 5000*0.3)
+  test_temp[[k]] <- train[idx,]
+}
+table(train_temp[[k]]$DLY)
+test_final <- test_norm %>% mutate(STT=as.integer(gsub(':','',STT))) %>% select(-DLY)
+```
+
+## 파라미터 탐색
+
+### Random Forest
+
+Random Forest를 학습하기 전에 앞서, 사용될 하이퍼 파라미터를 알아 봤습니다.
+
++ mtry : 선택할 Feature의 개수 (예측의 경우 변수의 개수/3 적합)
++ ntrees : 만들어 낼 나무의 개수
+
+#### 이 파트는 코드 실행 시 시간이 많이 소요되므로 eval=FALSE 를 통해 실행되지 않도록 설정했습니다. 실행을 원하시면 해당 문구를 삭제해주세요.
+
+```{r randomForest parameter, eval=FALSE}
+vars <- as.integer((length(colnames(train))-1)/3)
+c_mtry <- c(vars-1, vars, vars+1)
+
+mtry<-c(); mmse<-c()
+for (i in c_mtry){
+    c_error <- c()
+    for (k in 1:5){
+      set.seed(k)
+      cat(i,k,"\n")
+      mod_rf <- randomForest(DLY~., data=train_temp[[k]],
+                             mtry=i)
+      pred <- predict(mod_rf, test_temp[[k]])
+      error <- mse(test_temp[[k]]$DLY, pred)
+      c_error <- c_error %>% append(error)
+    }
+    mtry <- mtry %>% append(i)
+    mmse <- mmse %>% append(mean(c_error))
+  }
+table_rf <- data.frame(mtry, mmse) %>% arrange(mmse)
+table_rf %>% head(5)
+```
+
+### Logistic Regression
+
+로지스틱 회귀 분석은 조정해줄 하이퍼 파라미터는 없지만,
+
+변수 선택법을 통해 적합한 모델을 찾았습니다.
+
+#### 이 파트는 코드 실행 시 시간이 많이 소요되므로 eval=FALSE 를 통해 실행되지 않도록 설정했습니다. 실행을 원하시면 해당 문구를 삭제해주세요.
+
+```{r logistic parameter, eval=FALSE}
+c_error <- c()
+for (k in 1:5){
+  mod_glm_all <- glm(DLY~.+MIST:HM_INV, data=train_temp[[k]], family='binomial')
+  mod_glm_0 <- glm(DLY~1, data=train_temp[[k]], family='binomial')
+  mod_glm <- step(mod_glm_0,
+                  scope=list(lower=mod_glm_0, upper=mod_glm_all),
+                  direction='both', trace=0)
+  pred <- predict(mod_glm, test_temp[[k]], type='response')
+  error <- mse(test_temp[[k]]$DLY, pred)
+  c_error <- c_error %>% append(error)
+}
+table_glm <- data.frame(parameter=NA, mmse=mean(c_error))
+table_glm %>% head(1)
+```
+
+### Support Vector Machine
+
+SVM을 학습하기 앞서, 사용될 하이퍼 파라미터를 찾아봤습니다.
+
++ C : 제약을 위반할 때의 비용
+
++ gamma : *Gaussian* 커널을 조절하기 위한 파라미터
+
+#### 이 파트는 코드 실행 시 시간이 많이 소요되므로 eval=FALSE 를 통해 실행되지 않도록 설정했습니다. 실행을 원하시면 해당 문구를 삭제해주세요.
+
+```{r SVM parameter, eval=FALSE}
+c_hyper <- c(0.01, 0.1, 1, 5, 10)
+c_gamma <- c(0.1, 0.5, 1)
+hyper<-c(); gamma<-c(); mmse<-c()
+for(i in c_hyper){
+  for(j in c_gamma){
+    c_error<-c()
+    for(k in 1:5){
+      set.seed(k)
+      
+      mod_svm <- ksvm(DLY~., data=train_temp[[k]],
+                      kernel="rbfdot", C=i, gamma=j)
+      pred <- predict(mod_svm, test_temp[[k]])
+      error <- mse(pred, test_temp[[k]]$DLY)
+      c_error <- c_error %>% append(error)
+    }
+    hyper <- hyper %>% append(i)
+    gamma <- gamma %>% append(j)
+    mmse <- mmse %>% append(mean(c_error))
+  }
+}
+table_svm <- data.frame(hyper, gamma, mmse) %>% arrange(mmse)
+table_svm %>% head(5)
+```
+
+### eXtreme Gradient Boosting
+
+XGBoost 모델은 현재 Kaggle에서 자주 사용되며 가장 인기 있는 모델 중 하나입니다.
+
+모델을 사용하기 전에 사용되는 파라미터를 먼저 알아보았습니다.
+
++ max_depth : 최대 깊이 노드 
++ nrounds : 부스팅 반복 수 
++ eta : 학습률 
+
+#### 이 파트는 코드 실행 시 시간이 많이 소요되므로 eval=FALSE 를 통해 실행되지 않도록 설정했습니다. 실행을 원하시면 해당 문구를 삭제해주세요.
+
+```{r xgb parameter, eval=FALSE}
+c_max_depth <- c(4, 6, 8)
+c_nrounds <- c(50, 70, 100, 150, 200)
+c_eta <- c(0.1, 0.12, 0.14)
+
+max_depth<-c(); nrounds<-c(); eta<-c(); mmse<-c()
+for(i in c_max_depth){
+  for(j in c_nrounds){
+    for(l in c_eta){
+      c_error<-c()
+      for(k in 1:5){
+        set.seed(k)
+
+        mod_xgb <- xgboost(data=as.matrix(train_temp[[k]] %>% select(-'DLY')),
+                           label=as.numeric(train_temp[[k]]$DLY),
+                           max_depth=i,nrounds=j,eta=l,
+                           objective="binary:logistic",
+                           early_stopping_rounds=10, 
+                           verbose=0)
+        pred <- predict(mod_xgb, as.matrix(test_temp[[k]] %>% select(-'DLY')))
+        error <- mse(pred, test_temp[[k]]$DLY)
+        c_error <- c_error %>% append(error)
+      }
+      max_depth <- max_depth %>% append(i)
+      nrounds <- nrounds %>% append(j)
+      eta <- eta %>% append(k)
+      mmse <- mmse %>% append(mean(c_error))
+    }
+  }
+}
+table_xgb <- data.frame(max_depth,nrounds,eta,mmse) %>% arrange(mmse)
+table_xgb %>% head(5)
+```
+
+### Neural Network
+
+인공 신경망 모델은 입력 신호와 출력 신호 사이의 관계를 학습하며 
+
+인간의 뇌가 활동하는 방법과 비슷하게 움직입니다.
+
++ size : 은닉 계층의 뉴런 수
++ maxit : 반복 횟수
+
+#### 이 파트는 코드 실행 시 시간이 많이 소요되므로 eval=FALSE 를 통해 실행되지 않도록 설정했습니다. 실행을 원하시면 해당 문구를 삭제해주세요.
+
+```{r nnet parameter, eval=FALSE}
+c_size<-3:10
+c_maxit<-c(100,200,300)
+
+size<-c();maxit<-c();mmse<-c();
+for(i in c_size){
+  for(j in c_maxit){
+    c_error<-c()
+    for(k in 1:5){
+      set.seed(k)
+
+      mod_nnet <- nnet(DLY~., data=train_temp[[k]],
+                       size=i, decay=5e-04, maxit=j,
+                       act.fct="logistic", type="prob", trace=F)
+      pred <- predict(mod_nnet, test_temp[[k]])
+      error <- mse(pred, test_temp[[k]]$DLY)
+      c_error <- append(c_error, error)
+    }
+    size<-append(size,i)
+    maxit<-append(maxit,j)
+    mmse<-append(mmse,mean(c_error))
+  }
+}
+table_nnet <- data.frame(size,maxit,mmse) %>% arrange(mmse)
+table_nnet %>% head(5)
+```
+
+# Ensemble
+
+## 학습법 내 앙상블 
+  
+불균형 데이터를 배깅함에 있어서 로즈 샘플링을 적용하였습니다.  
+  
+이는 10,000개의 로즈 표집을 적합한 모델 5개의 평균 예측값을 
+
+학습법의 결과 예측값으로 설정합니다.
+
+#### 이 파트는 코드 실행 시 시간이 많이 소요되므로 eval=FALSE 를 통해 실행되지 않도록 설정했습니다. 실행을 원하시면 해당 문구를 삭제해주세요.
+  
+```{r ensemble within, eval=FALSE}
+list_rf<-list(); list_glm<-list(); list_svm<-list(); list_xgb<-list(); list_nnet<-list()
+for (k in 1:5){
+  set.seed(k)
+  
+  mod_rf <- randomForest(DLY~., data=train_actual[[k]], mtry=table_rf$mtry[1], ntree=500)
+  mod_glm_all <- glm(DLY~.+MIST:HM_INV, data=train_actual[[k]], family='binomial')
+  mod_glm_0 <- glm(DLY~1, data=train_actual[[k]], family='binomial')
+  mod_glm <- step(mod_glm_0, scope=list(lower=mod_glm_0, upper=mod_glm_all), direction='both', trace=0)
+  mod_svm <- ksvm(DLY~., data=train_actual[[k]], kernel="rbfdot", C=table_svm$hyper[1], gamma=table_svm$gamma[1])
+  mod_xgb <- xgboost(data=as.matrix(train_actual[[k]] %>% select(-DLY)), label=as.numeric(train_actual[[k]]$DLY),
+                     max_depth=table_xgb$max_depth[1], nrounds=table_xgb$nrounds[1], eta=table_xgb$eta[1],
+                     objective="binary:logistic", early_stopping_rounds=10, verbose=0)
+  mod_nnet <- nnet(DLY~., data=train_actual[[k]], size=table_nnet$size[1], decay=5e-04, maxit=table_nnet$maxit[1],
+                   act.fct="logistic", type="prob", trace=F)
+  
+  list_rf[[k]] <- mod_rf
+  list_glm[[k]] <- mod_glm
+  list_svm[[k]] <- mod_svm
+  list_xgb[[k]] <- mod_xgb
+  list_nnet[[k]] <- mod_nnet
+}
+```
+
+## 학습법 간 앙상블
+
+각 모델의 가지고 있는 장점들은 살리고 단점은 줄이기위해 학습법 간에 앙상블을 시도했습니다.
+
+#### 이 파트는 코드 실행 시 시간이 많이 소요되므로 eval=FALSE 를 통해 실행되지 않도록 설정했습니다. 실행을 원하시면 해당 문구를 삭제해주세요.
+
+```{r ensembel with models, eval=FALSE}
+pred_train <- function(line){
+  pred_rf<-c(); pred_glm<-c(); pred_svm<-c(); pred_xgb<-c(); pred_nnet<-c()
+  for (i in 1:5){
+    pred_rf <- pred_rf %>% append(predict(list_rf[[i]], line))
+    pred_glm <- pred_glm %>% append(predict(list_glm[[i]], line, type='response'))
+    pred_svm <- pred_svm %>% append(predict(list_svm[[i]], line))
+    pred_xgb <- pred_xgb %>% append(predict(list_xgb[[i]], as.matrix(line %>% select(-DLY))))
+    pred_nnet <- pred_nnet %>% append(predict(list_nnet[[i]], line))
+  }
+  result <- c(mean(pred_rf),mean(pred_glm),mean(pred_svm),mean(pred_xgb),mean(pred_nnet))
+  return(result)
+}
+
+pred_test <- function(line){
+  pred_rf<-c(); pred_glm<-c(); pred_svm<-c(); pred_xgb<-c(); pred_nnet<-c()
+  for (i in 1:5){
+    pred_rf <- pred_rf %>% append(predict(list_rf[[i]], line))
+    pred_glm <- pred_glm %>% append(predict(list_glm[[i]], line, type='response'))
+    pred_svm <- pred_svm %>% append(predict(list_svm[[i]], line))
+    pred_xgb <- pred_xgb %>% append(predict(list_xgb[[i]], as.matrix(line)))
+    pred_nnet <- pred_nnet %>% append(predict(list_nnet[[i]], line))
+  }
+  result <- c(mean(pred_rf),mean(pred_glm),mean(pred_svm),mean(pred_xgb),mean(pred_nnet))
+  return(result)
+}
+```
+
+## Predict
+
+### Prediction about *REG* Test data
+
+REG를 붙인 데이터들에 대해,  같은 REG를 가진 기체가 같은 날짜에 지연 되었다면,
+
+그 다음 비행들도 A/C접속으로 지연이 될 확률이 높으므로 같은 REG를 가진 데이터끼리 묶어서 예측했습니다.
+
+#### 이 파트는 코드 실행 시 시간이 많이 소요되므로 eval=FALSE 를 통해 실행되지 않도록 설정했습니다. 실행을 원하시면 해당 문구를 삭제해주세요.
+
+```{r predict in REG, eval=FALSE}
+output_final <- data.frame()
+for(i in 16:30){
+  testset <- test_final %>% filter(SDT_DD==i) %>% arrange(REG,STT) %>% select(-c(SDT_DD,STT))
+  reg_list <- unique(testset$REG)
+  output2 <- data.frame()
+  for(j in reg_list){
+    testset_REG <- testset %>% filter(REG==j)
+    testset_REG$PAST <- 0
+    idx <- testset_REG$INDEX
+    testset_REG <- testset_REG %>% select(-INDEX)
+    
+    if(j!=''){
+      testset_REG <- testset_REG %>% select(-REG)
+      class <- c(); pred <- c()
+      nr_reg<-nrow(testset_REG)
+      for(k in 1:nr_reg){
+        preds <- pred_test(testset_REG[k,])
+        if(k==1){
+          pred_class <- ifelse(sum(ifelse(preds>=.5,1,0))>=3,1,0)
+          pred_prob <- mean(preds)
+          testset_REG$PAST[2] <- ifelse(pred_class==1,1,0)
+        }
+        else if(k>1 & k<nr_reg){
+          pred_class <- ifelse(sum(ifelse(preds>=.5,1,0))>=3,1,0)
+          pred_prob <- mean(preds)
+          testset_REG$PAST[k+1] <- ifelse(pred_class==1,1,0)
+        }
+        else{
+          pred_class <- ifelse(sum(ifelse(preds>=.5,1,0))>=3,1,0)
+          pred_prob <- mean(preds)
+        }
+        class <- append(class, pred_class)
+        pred <- append(pred, pred_prob)
+      }
+      output1 <- cbind(INDEX=idx, DLY=class, DLY_RATE=pred)
+    }
+    
+    else{
+      testset_REG <- testset_REG %>% select(-REG)
+      class <- c(); pred <- c()
+      nr_reg<-nrow(testset_REG)
+      for(k in 1:nr_reg){
+        preds <- pred_test(testset_REG[k,])
+        pred_class <- ifelse(sum(ifelse(preds>=.5,1,0))>=3,1,0)
+        pred_prob <- mean(preds)
+        testset_REG$PAST[k] <- ifelse(pred_class==1,1,0)
+        
+        class <- append(class, pred_class)
+        pred <- append(pred, pred_prob)
+      }
+      output1 <- cbind(INDEX=idx, DLY=class, DLY_RATE=pred)
+    }
+    output2 <- rbind(output2, output1)
+  }
+  output_final <- rbind(output_final, output2)
+}
+
+str(output_final)
+
+shironmaro <- output_final %>% left_join(afsnt_dly, by='INDEX') %>% 
+  select(SDT_YY,SDT_MM,SDT_DD,SDT_DY,ARP,ODP,FLO,FLT,AOD,STT,DLY,DLY_RATE,INDEX) %>% 
+  arrange(INDEX) %>% select(-INDEX)
+
+table(shironmaro$DLY)
+head(shironmaro)
+# write.csv(shironmaro,"shironmaro.csv",row.names=F)
+```
